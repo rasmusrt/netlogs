@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Non-sandboxed (Developer ID / direct distribution). The App Sandbox blocks
+	  ICMP reception on macOS 26 with no entitlement to unblock it — see
+	  PHASE0-FINDINGS.md. Deliberately NO com.apple.security.app-sandbox key.
+
+	  network.client is kept as a statement of intent and so a sandboxed build
+	  (for experiments) still has it; it is a no-op for a non-sandboxed app.
+	-->
+	<key>com.apple.security.network.client</key>
+	<true/>
+</dict>
+</plist>
