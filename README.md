@@ -25,28 +25,8 @@ Sessions are saved, so you can compare last night with this morning.
 
 ## Install
 
-```bash
-brew tap rasmusrt/netlogs
-brew trust rasmusrt/netlogs
-brew install --cask netlogs
-```
-
-**The first launch will be refused, once.** Netlogs is ad-hoc signed rather
-than notarized: notarization requires a paid Apple Developer Program
-membership, and the Mac App Store isn't an alternative because its sandbox
-blocks the ICMP sockets this app is built on.
-
-So the first launch shows a dialog saying macOS can't verify the developer:
-
-1. **Click Cancel.** Do **not** click "Move to Trash" — it is the prominent
-   button in that dialog, and it deletes the app.
-2. Open **System Settings → Privacy & Security**, scroll to **Security**, and
-   click **Open Anyway** next to the message about Netlogs.
-3. Confirm. It launches, and keeps launching normally until the next version.
-
-### Or build it — no Gatekeeper prompt at all
-
-An app you compiled yourself was never downloaded, so it was never quarantined:
+**Build it. This is the supported path**, and on macOS 15+ it is currently the
+only one that works without a fight:
 
 ```bash
 git clone https://github.com/rasmusrt/netlogs.git
@@ -55,8 +35,39 @@ Scripts/app-bundle.sh
 ```
 
 That builds the app, installs it to `~/Applications`, and opens it. You need
-Xcode or the Command Line Tools; nothing else. Fewer steps than Homebrew, and
-no security prompt — this is the better path if you have the toolchain.
+Xcode or the Command Line Tools; nothing else. No security prompt, because an
+app you compiled was never downloaded and so was never quarantined.
+
+### Homebrew — works, but macOS will fight you
+
+```bash
+brew tap rasmusrt/netlogs
+brew trust rasmusrt/netlogs
+brew install --cask netlogs
+```
+
+The cask installs correctly. **macOS then refuses to run it**, and — this is
+the part worth knowing before you try — the usual escape hatch is not reliably
+available. Netlogs is ad-hoc signed rather than notarized, because
+notarization needs a paid Apple Developer Program membership and the Mac App
+Store is not an alternative (its sandbox blocks the ICMP sockets this app is
+built on). For a downloaded ad-hoc signed app, macOS 15+ shows a dialog whose
+only buttons are **Move to Trash** and **Done** — one deletes the app, the
+other gives up — and the "Open Anyway" button that is supposed to appear in
+System Settings → Privacy & Security does not always turn up.
+
+If it does not, the only way to run a Homebrew install is to clear the
+quarantine attribute yourself:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Netlogs.app
+```
+
+That is a real Gatekeeper bypass, and you should not run it on software just
+because a README told you to. Read the source, or build from it — the option
+above exists precisely so you never have to take this one on trust.
+
+This is fixed properly by notarization, not by better instructions.
 
 ## Requirements
 
