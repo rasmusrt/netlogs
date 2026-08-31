@@ -34,9 +34,15 @@ brew install --cask netlogs
 **The first launch will be refused, once.** Netlogs is ad-hoc signed rather
 than notarized: notarization requires a paid Apple Developer Program
 membership, and the Mac App Store isn't an alternative because its sandbox
-blocks the ICMP sockets this app is built on. So open the app, let macOS refuse
-it, then go to **System Settings → Privacy & Security → Open Anyway**. After
-that it launches normally, until the next version.
+blocks the ICMP sockets this app is built on.
+
+So the first launch shows a dialog saying macOS can't verify the developer:
+
+1. **Click Cancel.** Do **not** click "Move to Trash" — it is the prominent
+   button in that dialog, and it deletes the app.
+2. Open **System Settings → Privacy & Security**, scroll to **Security**, and
+   click **Open Anyway** next to the message about Netlogs.
+3. Confirm. It launches, and keeps launching normally until the next version.
 
 ### Or build it — no Gatekeeper prompt at all
 
