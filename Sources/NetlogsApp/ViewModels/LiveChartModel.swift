@@ -70,9 +70,12 @@ final class LiveChartModel {
     func append(_ sample: PingSample) {
         let sealedABucket = bucketer.append(sample)
         load.append(sample.phase == .idle ? nil : sample.phase, at: sample.timestamp)
+        // Silence, not missed deadlines — see `PingChartBucketer.series`. The
+        // live path and the saved path have to agree on this or a session looks
+        // different after it is reloaded.
         outage.append(
-            OutageScope(routerSilent: sample.routerMs == nil,
-                        internetSilent: sample.internetMs == nil),
+            OutageScope(routerSilent: sample.routerNoReply,
+                        internetSilent: sample.internetNoReply),
             at: sample.timestamp
         )
         recent.append(sample)

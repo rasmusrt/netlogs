@@ -1,14 +1,42 @@
 import Foundation
 
 /// Outcome of a single echo request.
+///
+/// `.timeout` and `.lateReply` are both failed probes — neither answered inside
+/// the deadline — but they are *not* the same fact about the network, and the
+/// app spent a long time unable to tell them apart. A session ending with 14
+/// "no reply"s recorded a maximum RTT of 1942 ms against a 2000 ms timeout:
+/// every one of those failures was a reply still in flight, arriving a few
+/// hundred milliseconds late, and being dropped on the floor because nothing
+/// was listening for it any more. The distribution was truncated exactly at the
+/// deadline, which made a queueing problem look like packet loss — and packet
+/// loss is what the user then went and argued about with their ISP.
+///
+/// So the pinger keeps listening past the deadline for a grace window and
+/// reports what it hears. `.lateReply` still counts as a failure everywhere
+/// loss is counted; what it adds is the *number*.
 public enum PingOutcome: Sendable, Equatable {
     case reply(rttMs: Double)
+    /// A reply that arrived after the timeout but within the grace window.
+    /// Carries the true round-trip time, which is by definition > the timeout.
+    case lateReply(rttMs: Double)
     case timeout
     case failure(String)
 
-    /// Round-trip time in milliseconds, or `nil` for a timeout/failure.
+    /// Round-trip time of a *timely* reply, `nil` otherwise.
+    ///
+    /// Deliberately `nil` for `.lateReply`: this is what feeds
+    /// `PingSample.routerMs`/`internetMs`, and a probe that missed its deadline
+    /// must keep reading as a miss in every existing consumer. The late number
+    /// travels alongside in ``lateRttMs``.
     public var rttMs: Double? {
         if case .reply(let ms) = self { return ms }
+        return nil
+    }
+
+    /// Round-trip time of a reply that missed the deadline, `nil` otherwise.
+    public var lateRttMs: Double? {
+        if case .lateReply(let ms) = self { return ms }
         return nil
     }
 }

@@ -25,8 +25,20 @@ Sessions are saved, so you can compare last night with this morning.
 
 ## Install
 
-**Build it. This is the supported path**, and on macOS 15+ it is currently the
-only one that works without a fight:
+### Homebrew
+
+```bash
+brew tap rasmusrt/netlogs
+brew trust rasmusrt/netlogs
+brew install --cask netlogs
+```
+
+Three commands, because Homebrew 6 asks for a tap outside the official ones to
+be tapped and trusted explicitly. Netlogs is signed with a Developer ID and
+notarized by Apple, so it opens like any other downloaded app. It is not on the
+Mac App Store because the App Sandbox blocks the ICMP sockets it is built on.
+
+### Build from source
 
 ```bash
 git clone https://github.com/rasmusrt/netlogs.git
@@ -35,39 +47,7 @@ Scripts/app-bundle.sh
 ```
 
 That builds the app, installs it to `~/Applications`, and opens it. You need
-Xcode or the Command Line Tools; nothing else. No security prompt, because an
-app you compiled was never downloaded and so was never quarantined.
-
-### Homebrew — works, but macOS will fight you
-
-```bash
-brew tap rasmusrt/netlogs
-brew trust rasmusrt/netlogs
-brew install --cask netlogs
-```
-
-The cask installs correctly. **macOS then refuses to run it**, and — this is
-the part worth knowing before you try — the usual escape hatch is not reliably
-available. Netlogs is ad-hoc signed rather than notarized, because
-notarization needs a paid Apple Developer Program membership and the Mac App
-Store is not an alternative (its sandbox blocks the ICMP sockets this app is
-built on). For a downloaded ad-hoc signed app, macOS 15+ shows a dialog whose
-only buttons are **Move to Trash** and **Done** — one deletes the app, the
-other gives up — and the "Open Anyway" button that is supposed to appear in
-System Settings → Privacy & Security does not always turn up.
-
-If it does not, the only way to run a Homebrew install is to clear the
-quarantine attribute yourself:
-
-```bash
-xattr -dr com.apple.quarantine /Applications/Netlogs.app
-```
-
-That is a real Gatekeeper bypass, and you should not run it on software just
-because a README told you to. Read the source, or build from it — the option
-above exists precisely so you never have to take this one on trust.
-
-This is fixed properly by notarization, not by better instructions.
+Xcode or the Command Line Tools; nothing else.
 
 ## Requirements
 

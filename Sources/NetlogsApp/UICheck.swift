@@ -98,7 +98,7 @@ enum UICheck {
             let r = controller.throughput.latest
             print("throughput     : ↓\(r.map { String(format: "%.0f", $0.downloadMbps) } ?? "—")"
                   + " ↑\(r.map { String(format: "%.0f", $0.uploadMbps) } ?? "—") Mbps"
-                  + "  bufferbloat +\(r.map { String(format: "%.0f", $0.bufferbloatMs) } ?? "—") ms"
+                  + "  bufferbloat +\(r?.bufferbloatMs.map { String(format: "%.0f", $0) } ?? "—") ms"
                   + "  (\(r?.isp ?? "—") / \(r?.serverLocation ?? "—"))  rows=\(tpRows)")
             // Nullable since schema 3, so a live test has to come back with
             // both actually measured — a `nil` reaching the card as "—" here

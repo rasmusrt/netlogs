@@ -28,6 +28,10 @@ final class AppSettings {
     /// Summary or chart. Lives here rather than in view state so the View menu
     /// can drive it, and so the choice survives a relaunch.
     var detailMode: DetailMode { didSet { persist() } }
+    /// How far back the Analysis screen looks. Optional in `Stored` so an
+    /// existing preferences blob still decodes, the same precedent
+    /// `detailMode` set.
+    var analysisRange: AnalysisRange { didSet { persist() } }
 
     private static let key = "netlogs.settings.v1"
 
@@ -36,6 +40,7 @@ final class AppSettings {
         var theme: AppTheme
         var retentionDays: Int
         var detailMode: DetailMode?
+        var analysisRange: AnalysisRange?
     }
 
     init() {
@@ -45,17 +50,20 @@ final class AppSettings {
             theme = saved.theme
             retentionDays = saved.retentionDays
             detailMode = saved.detailMode ?? .summary
+            analysisRange = saved.analysisRange ?? .week
         } else {
             monitor = .uiDefault
             theme = .system
             retentionDays = 30
             detailMode = .summary
+            analysisRange = .week
         }
     }
 
     private func persist() {
         let stored = Stored(monitor: monitor, theme: theme,
-                            retentionDays: retentionDays, detailMode: detailMode)
+                            retentionDays: retentionDays, detailMode: detailMode,
+                            analysisRange: analysisRange)
         if let data = try? JSONEncoder().encode(stored) {
             UserDefaults.standard.set(data, forKey: Self.key)
         }

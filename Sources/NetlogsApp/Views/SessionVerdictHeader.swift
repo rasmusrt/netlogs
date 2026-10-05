@@ -17,6 +17,17 @@ struct SessionVerdictHeader: View {
     let elapsed: TimeInterval
     let sampleCount: Int
     let failureCount: Int
+    /// Of `failureCount`, the ones where nothing came back at all. This is what
+    /// the header counts, because "lost" has to mean lost — see
+    /// ``LiveSummary/noReplyCount``. Defaults to `failureCount` so a caller
+    /// that has not been updated keeps the old, conservative behaviour rather
+    /// than silently reporting zero loss.
+    var lostCount: Int?
+    /// Of `failureCount`, the ones a host answered late.
+    var lateCount: Int = 0
+    /// Of `failureCount`, the ones measured while the app's own speed test was
+    /// loading the link.
+    var underLoadCount: Int = 0
     var status: StatusChip?
     /// Set to make the failure count a button. The failures sheet is the only
     /// place that lists them, so this is its entry point.
@@ -83,7 +94,7 @@ struct SessionVerdictHeader: View {
                 dot
                 vital(sampleCount.formatted(), "samples")
                 dot
-                failuresVital(failureCount == 1 ? "failure" : "failures")
+                failuresVital(lost == 1 ? "lost" : "lost")
             }
             .fixedSize()
 
@@ -105,16 +116,42 @@ struct SessionVerdictHeader: View {
 
     private var dot: some View { Text("·").foregroundStyle(.quaternary) }
 
+    /// Packets that never came back. Falls back to every failure when the
+    /// caller has not supplied the split.
+    private var lost: Int { lostCount ?? failureCount }
+
+    /// Spells out what the headline number leaves out. Both of these read as
+    /// loss in the old header, and neither is: a late reply is a slow link, and
+    /// a failure under load is one this app caused by saturating the uplink to
+    /// measure it.
+    private var breakdown: String {
+        var parts = ["Show every failed ping with its timestamp"]
+        if lateCount > 0 {
+            parts.append("\(lateCount) more replied after the timeout — slow, not lost")
+        }
+        if underLoadCount > 0 {
+            parts.append("\(underLoadCount) happened during a speed test")
+        }
+        return parts.joined(separator: ". ")
+    }
+
     /// Clickable when there is something to show, plain text otherwise — a
     /// button that opens an empty sheet is worse than no button.
     @ViewBuilder
     private func failuresVital(_ label: String) -> some View {
-        let tint: Color? = failureCount > 0 ? Palette.bad : nil
+        // Tinted on real loss only. A session whose every "failure" was a late
+        // reply is a slow session, not a broken one, and painting the count red
+        // is the same overstatement in colour that the word "lost" was in text.
+        let tint: Color? = lost > 0 ? Palette.bad : nil
         if let onShowFailures, failureCount > 0 {
             Button(action: onShowFailures) {
                 HStack(spacing: Space.xs) {
-                    Text(failureCount.formatted()).monospacedDigit().foregroundStyle(tint ?? .primary)
+                    Text(lost.formatted()).monospacedDigit().foregroundStyle(tint ?? .primary)
                     Text(label)
+                    if lateCount > 0 {
+                        Text("+\(lateCount) slow")
+                            .foregroundStyle(.tertiary)
+                    }
                     Image(systemName: "chevron.right")
                         .font(.system(size: 8, weight: .semibold))
                         .foregroundStyle(.tertiary)
@@ -122,9 +159,9 @@ struct SessionVerdictHeader: View {
             }
             .buttonStyle(.plain)
             .pointerStyle(.link)
-            .help("Show every failed ping with its timestamp")
+            .help(breakdown)
         } else {
-            vital(failureCount.formatted(), label, tint: tint)
+            vital(lost.formatted(), label, tint: tint)
         }
     }
 

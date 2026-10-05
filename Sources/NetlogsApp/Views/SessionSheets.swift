@@ -5,6 +5,9 @@ enum PingHost: String, Hashable, CaseIterable, Identifiable {
     case router, internet
     var id: Self { self }
     var title: String { self == .router ? "Router" : "Internet" }
+    /// The thresholds this host's figures are judged by — a gateway and an
+    /// internet host do not deserve the same ramp. See `LatencyGrade.Ramp`.
+    var ramp: LatencyGrade.Ramp { self == .router ? .gateway : .internet }
 }
 
 /// What a summary card, or the header's failure count, opens.
@@ -18,6 +21,8 @@ enum SessionSheet: String, CaseIterable, Identifiable, Hashable {
     case throughput = "Speed tests"
     case network = "Network"
     case failures = "Failures"
+    case traffic = "Traffic"
+    case gateway = "Gateway"
 
     var id: Self { self }
 
@@ -41,6 +46,8 @@ enum SessionSheet: String, CaseIterable, Identifiable, Hashable {
         case .throughput: return 560
         case .network:    return 560
         case .failures:   return 560
+        case .traffic:    return 520
+        case .gateway:    return 560
         }
     }
 
@@ -50,6 +57,8 @@ enum SessionSheet: String, CaseIterable, Identifiable, Hashable {
         case .throughput: return "speedometer"
         case .network:    return "wifi"
         case .failures:   return "exclamationmark.triangle"
+        case .traffic:    return "arrow.up.arrow.down"
+        case .gateway:    return "antenna.radiowaves.left.and.right"
         }
     }
 }
@@ -81,6 +90,11 @@ struct SessionSheetView: View {
     /// sheet opens instantly there instead of waiting on a history read.
     var liveFailures: [PingSample]?
     var liveFailureTotal: Int?
+    /// Same arrangement as failures: the live screen already holds every
+    /// capture in memory, so the sheet reads them from there rather than
+    /// re-querying a session that is still being written.
+    var liveTraffic: [TrafficCapture]?
+    var liveCapturing: Bool = false
     /// Results the running session already holds in memory.
     ///
     /// Diagnostics and failures were already served this way; throughput was
@@ -149,6 +163,13 @@ struct SessionSheetView: View {
                 latest: liveDiagnostics ?? detail?.summary.diagnostics.last,
                 trace: liveTrace ?? detail?.diagnosticsTrace ?? DiagnosticsTrace()
             )
+        case .traffic:
+            TrafficDetail(
+                captures: liveTraffic ?? detail?.traffic ?? [],
+                isCapturing: liveCapturing
+            )
+        case .gateway:
+            GatewayDetail(trace: detail?.wanTrace ?? WANTrace())
         case .failures:
             FailuresDetail(
                 failures: liveFailures ?? detail?.failures.reversed() ?? [],
@@ -168,7 +189,7 @@ private struct FailuresDetail: View {
     var body: some View {
         if failures.isEmpty {
             ContentUnavailableView(
-                "No failures",
+                "Nothing missed a deadline",
                 systemImage: "checkmark.seal",
                 description: Text(sampleCount.map { "Both hosts replied to all \($0.formatted()) pings." }
                                   ?? "Both hosts have replied to every ping.")
@@ -184,14 +205,16 @@ private struct FailuresDetail: View {
                     .width(160)
 
                     TableColumn("Router") { sample in
-                        HostOutcome(ms: sample.routerMs)
+                        HostOutcome(ms: sample.routerMs, lateMs: sample.routerLateMs,
+                                    ramp: .gateway)
                     }
-                    .width(110)
+                    .width(130)
 
                     TableColumn("Internet") { sample in
-                        HostOutcome(ms: sample.internetMs)
+                        HostOutcome(ms: sample.internetMs, lateMs: sample.internetLateMs,
+                                    ramp: .internet)
                     }
-                    .width(110)
+                    .width(130)
 
                     TableColumn("Load") { sample in
                         if sample.phase != .idle {
@@ -214,8 +237,27 @@ private struct FailuresDetail: View {
         }
     }
 
+    /// Splits the total into the three things it is actually made of.
+    ///
+    /// The old footnote said "14 failed pings · 0.0% of the session", which is
+    /// true and reads as packet loss. On the session that prompted this, none
+    /// of the 14 were lost: every one came back late, and three of the five
+    /// clusters were the app's own upload test filling the uplink queue. The
+    /// percentage stays — but it is now a percentage of something named.
     private var footnote: String {
-        var parts = ["\(total.formatted()) failed ping\(total == 1 ? "" : "s")"]
+        // Counted over the rows on screen when they are all here; the totals
+        // the header holds are the authority when they are not.
+        let shown = failures
+        let lost = shown.filter { $0.routerNoReply || $0.internetNoReply }.count
+        let late = shown.count - lost
+        let underLoad = shown.filter(\.isUnderLoad).count
+
+        var parts = ["\(total.formatted()) missed deadline\(total == 1 ? "" : "s")"]
+        if failures.count == total {
+            parts.append(lost == 0 ? "none lost" : "\(lost) lost")
+            if late > 0 { parts.append("\(late) replied late") }
+            if underLoad > 0 { parts.append("\(underLoad) during a speed test") }
+        }
         if let sampleCount, sampleCount > 0 {
             parts.append(Fmt.percent(Double(total) / Double(sampleCount)) + " of the session")
         }
@@ -227,14 +269,38 @@ private struct FailuresDetail: View {
 }
 
 /// Which host answered and which did not — the distinction the sheet exists for.
+///
+/// Three outcomes, not two. A host that answered late gets its real round-trip
+/// time shown with a "late" marker rather than the flat "no reply" it used to
+/// get, because those are the rows a user takes to their ISP and "no reply" is
+/// the wrong thing to take: it says a packet was dropped when what happened is
+/// that a queue was full for two and a half seconds.
 private struct HostOutcome: View {
     let ms: Double?
+    let lateMs: Double?
+    let ramp: LatencyGrade.Ramp
+
+    init(ms: Double?, lateMs: Double? = nil, ramp: LatencyGrade.Ramp) {
+        self.ms = ms
+        self.lateMs = lateMs
+        self.ramp = ramp
+    }
 
     var body: some View {
         if let ms {
             Text(Fmt.msLabel(ms))
                 .font(.tabularSmall)
-                .foregroundStyle(Palette.pill(ms))
+                .foregroundStyle(Palette.pill(ms, on: ramp))
+        } else if let lateMs {
+            HStack(spacing: Space.xs) {
+                Text(Fmt.msLabel(lateMs))
+                    .font(.tabularSmall)
+                    .foregroundStyle(Palette.pill(lateMs, on: ramp))
+                Text("late")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .help("Replied after the timeout. The packet arrived; it missed the deadline.")
         } else {
             Text("no reply")
                 .font(.tabularSmall.weight(.semibold))
@@ -305,7 +371,7 @@ private struct LatencyDetail: View {
     private func percentileRow(_ label: String, _ ms: Double, help: String) -> some View {
         DetailRow(label: label,
                      value: Fmt.msLabel(ms),
-                     tint: Palette.latency(ms),
+                     tint: Palette.latency(ms, on: host.ramp),
                      help: help)
     }
 
@@ -332,7 +398,7 @@ private struct LatencyDetail: View {
                         label: sample.timestamp
                             .formatted(.dateTime.hour().minute().second()),
                         value: Fmt.msLabel(ms),
-                        tint: ms.flatMap { Palette.latency($0) }
+                        tint: ms.flatMap { Palette.latency($0, on: host.ramp) }
                     )
                     .padding(.horizontal, Space.xs)
                     .padding(.vertical, 3)
@@ -373,19 +439,20 @@ private struct ThroughputDetail: View {
                         DetailRow(label: "Upload",
                                      value: "\(Fmt.mbps(averages.uploadMbps)) Mbps")
                         DetailRow(label: "Bufferbloat",
-                                     value: "+\(Fmt.msCoarse(averages.bufferbloatMs)) ms",
-                                     tint: Palette.bufferbloat(averages.bufferbloatMs),
+                                     value: averages.bufferbloatMs
+                                         .map { "+\(Fmt.msCoarse($0)) ms" } ?? "—",
+                                     tint: averages.bufferbloatMs.map(Palette.bufferbloat),
                                      help: Explain.bufferbloat)
                         DetailRow(label: "Packet loss",
                                      value: Fmt.percent(averages.packetLoss),
                                      help: Explain.packetLoss)
                         DetailRow(label: "Ping under load",
                                      value: Fmt.msLabel(averages.loadedLatencyMs),
-                                     tint: averages.loadedLatencyMs.flatMap { Palette.latency($0) },
+                                     tint: averages.loadedLatencyMs.flatMap { Palette.latency($0, on: .internet) },
                                      help: Explain.testAverage)
                         DetailRow(label: "Jitter under load",
                                      value: Fmt.msLabel(averages.loadedJitterMs),
-                                     tint: averages.loadedJitterMs.flatMap { Palette.latency($0) },
+                                     tint: averages.loadedJitterMs.flatMap { Palette.jitter($0) },
                                      help: Explain.testJitter)
                     }
                     .padding(Space.m)
@@ -400,15 +467,20 @@ private struct ThroughputDetail: View {
     }
 
     private func testCard(_ result: ThroughputResult) -> some View {
-        let grade = BufferbloatGrade(milliseconds: result.bufferbloatMs)
+        let grade = result.bufferbloatMs.map { BufferbloatGrade(milliseconds: $0) }
         return VStack(alignment: .leading, spacing: Space.s) {
             HStack {
                 Text(result.timestamp, format: .dateTime.month().day().hour().minute())
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
-                StatusBadge(text: grade.label, color: Palette.grade(grade),
-                            showsDot: false, size: .small)
+                // No badge at all when bufferbloat was never measured — an
+                // "excellent" grade derived from an unmeasured baseline is the
+                // exact claim schema 5 exists to stop making.
+                if let grade {
+                    StatusBadge(text: grade.label, color: Palette.grade(grade),
+                                showsDot: false, size: .small)
+                }
             }
             // The headline six, in the same order as the Speed card on the
             // Monitor screen — so the summary and one test read the same way.
@@ -476,7 +548,7 @@ private struct ThroughputDetail: View {
     }
 
     @ViewBuilder
-    private func headlineMetrics(_ result: ThroughputResult, _ grade: BufferbloatGrade) -> some View {
+    private func headlineMetrics(_ result: ThroughputResult, _ grade: BufferbloatGrade?) -> some View {
         speedMetrics(result, grade)
         pingMetrics(result)
     }
@@ -485,11 +557,12 @@ private struct ThroughputDetail: View {
     /// badge: with all three phase latencies in the table below, the number
     /// derived from them was the one thing the card stopped saying out loud.
     @ViewBuilder
-    private func speedMetrics(_ result: ThroughputResult, _ grade: BufferbloatGrade) -> some View {
+    private func speedMetrics(_ result: ThroughputResult, _ grade: BufferbloatGrade?) -> some View {
         MetricView("down", Fmt.mbps(result.downloadMbps), unit: "Mbps")
         MetricView("up", Fmt.mbps(result.uploadMbps), unit: "Mbps")
-        MetricView("bufferbloat", "+\(Fmt.msCoarse(result.bufferbloatMs))",
-                   unit: "ms", tint: Palette.grade(grade))
+        MetricView("bufferbloat",
+                   result.bufferbloatMs.map { "+\(Fmt.msCoarse($0))" },
+                   unit: "ms", tint: grade.map(Palette.grade))
     }
 
     /// Loss over the whole test window, then ping and jitter **under load**.
@@ -512,15 +585,15 @@ private struct ThroughputDetail: View {
                    tint: result.packetLoss.map { $0 >= SessionVerdict.lossyLossRatio
                                                  ? Palette.bad : nil } ?? nil)
         MetricView("ping under load", Fmt.ms(latency), unit: "ms",
-                   tint: Palette.latency(latency))
+                   tint: latency.flatMap { Palette.latency($0, on: .internet) })
         MetricView("jitter under load", Fmt.ms(jitter), unit: "ms",
-                   tint: jitter.flatMap { Palette.latency($0) })
+                   tint: jitter.flatMap { Palette.jitter($0) })
     }
 
     /// One phase. Everything but the mean is optional — results recorded before
     /// schema 4 have no spread at all, and a phase whose window caught nothing
     /// has none either, so both render "—" rather than a fabricated 0.
-    private func phaseRow(_ label: String, _ latency: Double,
+    private func phaseRow(_ label: String, _ latency: Double?,
                           _ jitter: Double?, _ low: Double?, _ high: Double?) -> some View {
         GridRow {
             Text(label)
@@ -528,11 +601,11 @@ private struct ThroughputDetail: View {
                 .foregroundStyle(.secondary)
                 .gridColumnAlignment(.leading)
             Text(Fmt.ms(latency))
-                .foregroundStyle(Palette.latency(latency) ?? .primary)
+                .foregroundStyle(latency.flatMap { Palette.latency($0, on: .internet) } ?? .primary)
             Text(Fmt.ms(jitter)).foregroundStyle(.secondary)
             Text(Fmt.ms(low)).foregroundStyle(.secondary)
             Text(Fmt.ms(high))
-                .foregroundStyle(high.flatMap { Palette.latency($0) }
+                .foregroundStyle(high.flatMap { Palette.latency($0, on: .internet) }
                                  .map { AnyShapeStyle($0) } ?? AnyShapeStyle(.secondary))
         }
         .font(.tabularSmall)
@@ -745,5 +818,113 @@ struct CloseButton: View {
         .keyboardShortcut(.defaultAction)
         .accessibilityLabel("Close")
         .help("Close")
+    }
+}
+
+// MARK: - Traffic
+
+/// What this Mac was sending when latency diverged.
+///
+/// One section per capture, busiest uploader first. The empty states carry most
+/// of the meaning here and are worth reading closely — see below.
+private struct TrafficDetail: View {
+    let captures: [TrafficCapture]
+    let isCapturing: Bool
+
+    var body: some View {
+        if captures.isEmpty {
+            ContentUnavailableView(
+                isCapturing ? "Capturing…" : "Nothing to show",
+                systemImage: isCapturing ? "arrow.triangle.2.circlepath" : "checkmark.seal",
+                description: Text(isCapturing
+                    ? "Reading what this Mac is sending. Takes about five seconds."
+                    : "Latency has not diverged far enough to trigger a capture. "
+                      + "These are taken when the internet is slow while the router is fine.")
+            )
+        } else {
+            ScrollView {
+                VStack(alignment: .leading, spacing: Space.m) {
+                    if isCapturing {
+                        Label("Capturing…", systemImage: "arrow.triangle.2.circlepath")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(captures) { capture in
+                        section(capture)
+                    }
+                    footnote
+                }
+                .padding(Space.m)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func section(_ capture: TrafficCapture) -> some View {
+        VStack(alignment: .leading, spacing: Space.s) {
+            HStack(alignment: .firstTextBaseline, spacing: Space.s) {
+                Text(capture.timestamp, format: .dateTime.hour().minute().second())
+                    .font(.headline.monospacedDigit())
+                Text(trigger(capture))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                Text(Fmt.rate(capture.uploadBytesPerSecond) + " up")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            if capture.processes.isEmpty {
+                // The most useful thing this sheet can say, and the one a
+                // blank list would swallow. Nothing on this Mac was sending
+                // while the connection was struggling, so whatever filled the
+                // uplink is on another device.
+                Label(
+                    "Nothing on this Mac was sending. Look at another device on the network.",
+                    systemImage: "questionmark.circle"
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            } else {
+                ForEach(capture.processes, id: \.self) { process in
+                    HStack(spacing: Space.s) {
+                        Text(process.name)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer(minLength: Space.s)
+                        Text(Fmt.rate(process.bytesOutPerSecond))
+                            .font(.tabularSmall)
+                            .foregroundStyle(process.bytesOutPerSecond > 0 ? Palette.bad : .secondary)
+                            .frame(width: 90, alignment: .trailing)
+                        Text(Fmt.rate(process.bytesInPerSecond))
+                            .font(.tabularSmall)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 90, alignment: .trailing)
+                    }
+                }
+                HStack(spacing: Space.s) {
+                    Spacer(minLength: 0)
+                    Text("sent").frame(width: 90, alignment: .trailing)
+                    Text("received").frame(width: 90, alignment: .trailing)
+                }
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(Space.s)
+        .background(Palette.rowStripe, in: RoundedRectangle(cornerRadius: Radius.control))
+    }
+
+    private func trigger(_ capture: TrafficCapture) -> String {
+        let internet = capture.internetMs.map { Fmt.msLabel($0) } ?? "no reply"
+        let router = capture.routerMs.map { Fmt.msLabel($0) } ?? "no reply"
+        return "internet \(internet) · router \(router)"
+    }
+
+    private var footnote: some View {
+        Text("Rates are measured over one second, on this Mac only. "
+             + "Other devices on the network do not appear here.")
+            .font(.caption)
+            .foregroundStyle(.tertiary)
     }
 }

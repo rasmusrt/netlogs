@@ -6,23 +6,31 @@ import XCTest
 /// them provably identical.
 final class SessionVerdictTests: XCTestCase {
 
+    /// `failures` are internet timeouts, which is the common case; a
+    /// router-only outage is built with `routerFailures` instead. The two were
+    /// conflated here before — this helper hardcoded `routerTimeouts: 0`, which
+    /// is precisely why nothing caught the verdict scoring router silence as
+    /// connection loss.
     private func summary(
         samples: Int,
         failures: Int = 0,
+        routerFailures: Int = 0,
         internetSamples: Int? = nil,
         jitter: Double = 2,
         avg: Double = 20
     ) -> LiveSummary {
         LiveSummary(
             router: PingStat(min: 1, avg: 3, max: 8, jitter: 1, p50: 3, p95: 5, p99: 7,
-                             samples: samples - failures),
+                             samples: samples - routerFailures),
             internet: PingStat(min: avg / 2, avg: avg, max: avg * 3, jitter: jitter,
                                p50: avg, p95: avg * 2, p99: avg * 3,
                                samples: internetSamples ?? (samples - failures)),
             totalSamples: samples,
-            routerTimeouts: 0,
+            routerTimeouts: routerFailures,
             internetTimeouts: failures,
-            failureCount: failures
+            // Samples where *either* host was silent. Overlap is not modelled;
+            // tests set one side or the other.
+            failureCount: failures + routerFailures
         )
     }
 
@@ -144,5 +152,76 @@ final class SessionVerdictTests: XCTestCase {
                                       throughput: averages(bufferbloatMs: 200)).isEmpty
             )
         }
+    }
+
+    // MARK: - Router loss is not connection loss
+
+    /// The defect: a gateway that drops ICMP while the internet answers
+    /// everything used to read "Connection down — 600 of 600 pings lost",
+    /// beside an Internet card showing 600 replies.
+    func testRouterOnlyLossIsNotOffline() {
+        let s = summary(samples: 600, failures: 0, routerFailures: 600)
+        let verdict = SessionVerdict.evaluate(summary: s)
+
+        XCTAssertEqual(verdict, .routerLossy)
+        XCTAssertNotEqual(verdict, .offline)
+        XCTAssertEqual(verdict.severity, 1, "the internet works; this is a warning")
+
+        let reason = SessionVerdict.reason(for: verdict, summary: s)
+        XCTAssertTrue(reason.contains("router"), reason)
+        XCTAssertTrue(reason.contains("internet unaffected"), reason)
+    }
+
+    /// Partial router loss, still not the internet's problem.
+    func testPartialRouterLossReportsTheRouter() {
+        XCTAssertEqual(
+            SessionVerdict.evaluate(summary: summary(samples: 600, routerFailures: 60)),
+            .routerLossy
+        )
+    }
+
+    /// And the other half of the fix: with loss measured on the internet alone,
+    /// router silence must not fall through to "healthy" either.
+    func testRouterLossIsNeverReportedAsHealthy() {
+        for lost in [30, 100, 599, 600] {
+            XCTAssertNotEqual(
+                SessionVerdict.evaluate(summary: summary(samples: 600, routerFailures: lost)),
+                .good,
+                "\(lost) router timeouts"
+            )
+        }
+    }
+
+    /// Below the reporting threshold the router is not worth mentioning, the
+    /// same rule internet loss already followed.
+    func testTrivialRouterLossStaysHealthy() {
+        XCTAssertEqual(
+            SessionVerdict.evaluate(summary: summary(samples: 600, routerFailures: 2)),
+            .good
+        )
+    }
+
+    /// Internet loss still outranks router loss: if both are dropping, the one
+    /// the user actually feels is the one named.
+    func testInternetLossOutranksRouterLoss() {
+        XCTAssertEqual(
+            SessionVerdict.evaluate(summary: summary(samples: 600, failures: 300,
+                                                     routerFailures: 300)),
+            .offline
+        )
+        XCTAssertEqual(
+            SessionVerdict.evaluate(summary: summary(samples: 600, failures: 30,
+                                                     routerFailures: 300)),
+            .lossy
+        )
+    }
+
+    /// The loss figures quoted in the reason describe the internet host, not
+    /// the union of both.
+    func testLossReasonCountsInternetTimeoutsOnly() {
+        let s = summary(samples: 1000, failures: 50, routerFailures: 400)
+        let reason = SessionVerdict.reason(for: .lossy, summary: s)
+        XCTAssertTrue(reason.contains("50 of 1000"), reason)
+        XCTAssertFalse(reason.contains("450"), reason)
     }
 }

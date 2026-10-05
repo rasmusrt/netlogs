@@ -21,6 +21,16 @@ struct SummaryCards: View {
     let internetHost: String
     let throughput: ThroughputAverages
     let diagnostics: DiagnosticsSnapshot?
+    /// What this Mac was sending during the session's latency episodes. Empty
+    /// on a healthy session, which is most of them — see `trafficCard`.
+    var traffic: [TrafficCapture] = []
+    var isCapturingTraffic = false
+    /// The gateway card appears only for a session that read the gateway, so a
+    /// Mac without a UniFi gateway never sees an empty one.
+    var showsGateway = false
+    var gatewayRadio: CellularRadio?
+    /// Why the latest gateway poll failed, if it did.
+    var gatewayProblem: String?
     var isTesting = false
     var testingPhase: LoadPhase = .idle
     var onRunTest: (() -> Void)?
@@ -61,22 +71,71 @@ struct SummaryCards: View {
                            isTesting: isTesting, phase: testingPhase, onRun: onRunTest)
                 .tappable(.throughput, onSelect)
 
-            NetworkCard(snapshot: diagnostics)
-                .tappable(.network, onSelect)
+            // The local link and the WAN beside each other when the gateway is
+            // being read — the same "which side of the router" comparison as
+            // the latency pair above, one level down. Same `ViewThatFits`, for
+            // the same reason.
+            if showsGateway {
+                ViewThatFits(in: .horizontal) {
+                    // Equal heights: the two cards hold different rows, and a
+                    // pair of mismatched boxes reads as a layout bug.
+                    HStack(spacing: Space.xs + 2) {
+                        networkCard.frame(minWidth: 250)
+                        gatewayCard.frame(minWidth: 250)
+                    }
+                    .environment(\.cardFillsHeight, true)
+                    .fixedSize(horizontal: false, vertical: true)
+                    VStack(spacing: Space.xs + 2) {
+                        networkCard
+                        gatewayCard
+                    }
+                }
+            } else {
+                networkCard
+            }
+
+            trafficCard
         }
+    }
+
+    /// Present only when there is something to say.
+    ///
+    /// Unlike the other four this card is *conditional*, and deliberately so. A
+    /// healthy session never triggers a capture, so a permanent card would sit
+    /// empty through every good night — teaching the eye to skip the one place
+    /// that will eventually hold the answer. It is the same argument as the
+    /// sidebar's status dot: absence is the signal.
+    @ViewBuilder
+    private var trafficCard: some View {
+        if !traffic.isEmpty || isCapturingTraffic {
+            TrafficCard(captures: traffic, isCapturing: isCapturingTraffic)
+                .tappable(.traffic, onSelect)
+        }
+    }
+
+    private var networkCard: some View {
+        NetworkCard(snapshot: diagnostics)
+            .tappable(.network, onSelect)
+    }
+
+    private var gatewayCard: some View {
+        GatewayCard(radio: gatewayRadio, problem: gatewayProblem)
+            .tappable(.gateway, onSelect)
     }
 
     private var routerCard: some View {
         LatencyCard(title: "Router", host: routerHost,
-                    stat: latency.router,
-                    systemImage: "wifi.router", help: Explain.routerCard)
+                    stat: latency.router, late: latency.routerLate,
+                    systemImage: "wifi.router", help: Explain.routerCard,
+                    ramp: .gateway)
             .tappable(.latency, onSelect)
     }
 
     private var internetCard: some View {
         LatencyCard(title: "Internet", host: internetHost,
-                    stat: latency.internet,
-                    systemImage: "globe", help: Explain.internetCard)
+                    stat: latency.internet, late: latency.internetLate,
+                    systemImage: "globe", help: Explain.internetCard,
+                    ramp: .internet)
             .tappable(.latency, onSelect)
     }
 }
@@ -95,6 +154,7 @@ struct SummaryCard<Content: View>: View {
     /// part you hover when you are asking "what is this card?".
     var help: String?
     @ViewBuilder var content: Content
+    @Environment(\.cardFillsHeight) private var fillsHeight
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.xs) {
@@ -127,8 +187,24 @@ struct SummaryCard<Content: View>: View {
         }
         .padding(.horizontal, Space.m)
         .padding(.vertical, Space.s + 2)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity,
+               maxHeight: fillsHeight ? .infinity : nil,
+               alignment: .topLeading)
         .cardSurface()
+    }
+}
+
+/// Set on a row of cards that should share one height. The surface is drawn
+/// inside the card, so stretching the card from outside would stretch an
+/// invisible frame and leave the backgrounds at their own heights.
+private struct CardFillsHeightKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var cardFillsHeight: Bool {
+        get { self[CardFillsHeightKey.self] }
+        set { self[CardFillsHeightKey.self] = newValue }
     }
 }
 
@@ -248,6 +324,24 @@ enum Explain {
         "The single slowest reply. One bad sample, not a trend — the p95 in the "
         + "Latency sheet is the better measure of the bad moments."
 
+    /// Shown instead of `maximum` when the peak is a reply that came back after
+    /// the ping timeout.
+    ///
+    /// Without this the figure is a ceiling, not a measurement: a reply that
+    /// misses the deadline used to be discarded, so "max" could never exceed
+    /// the timeout no matter how bad the link got. A session that peaked at
+    /// 2.4 s reported a 1.9 s maximum and called the rest packet loss.
+    static let trafficCard =
+        "Taken automatically when the internet goes slow while the router stays "
+        + "fast — the moment worth knowing what this Mac was sending. It sees "
+        + "this Mac only: if the uploader is a NAS, a phone or a TV, this card "
+        + "will correctly show nothing, and that is itself the answer."
+
+    static let maximumLate =
+        "The slowest reply of the session — and it came back after the ping "
+        + "timeout, so it counts as a missed deadline as well. A number above "
+        + "the timeout means the reply arrived; it was just late."
+
     static let routerCard =
         "Your own router, the first hop out of this Mac. It measures your local "
         + "network only. If this is slow, the problem is inside your home."
@@ -268,24 +362,41 @@ struct LatencyCard: View {
     let title: String
     let host: String
     let stat: PingStat
+    /// Replies that came back after the deadline. `PingStat.max` is clipped at
+    /// the ping timeout by construction, so on a session with any of these it
+    /// is not the slowest reply — it is the slowest reply *that fitted*.
+    var late: LateReplies = .init()
     let systemImage: String
     let help: String
+    /// The two cards sit one above the other and are read against each other,
+    /// which only works if each is judged on its own leg's thresholds.
+    let ramp: LatencyGrade.Ramp
+
+    /// The slowest reply actually observed, late ones included.
+    private var peak: Double { late.worst(timelyMax: stat.max) }
+    /// …and whether the figure on screen is one of those, which changes what
+    /// the number means enough to be worth saying in the label.
+    private var peakIsLate: Bool { (late.max ?? 0) > stat.max }
 
     var body: some View {
         SummaryCard(title: title, systemImage: systemImage, subtitle: host,
                     help: help) {
             HStack(alignment: .firstTextBaseline, spacing: Space.m) {
-                // Min green, max red — the simplest honest mapping, and the one
-                // the prototype used. Average stays neutral so the two ends of
-                // the range are what the eye lands on.
+                // Min green *when it deserves it*, max red — the two ends of
+                // the range are what the eye lands on, so the average stays
+                // neutral. Min was hardcoded to green, which made a session
+                // whose best ping was 900 ms show a green floor beside a red
+                // ceiling: the one figure that cannot lie about a connection
+                // being fine, lying about it.
                 StatValue(label: "min", value: number(stat.min), unit: "ms",
-                          tint: stat.samples == 0 ? nil : Palette.good,
+                          tint: stat.samples == 0 ? nil : Palette.pill(stat.min, on: ramp),
                           help: Explain.minimum)
                 StatValue(label: "avg", value: number(stat.avg), unit: "ms",
                           help: Explain.average)
-                StatValue(label: "max", value: number(stat.max), unit: "ms",
-                          tint: stat.samples == 0 ? nil : Palette.latency(stat.max) ?? .primary,
-                          help: Explain.maximum)
+                StatValue(label: peakIsLate ? "max (late)" : "max",
+                          value: number(peak), unit: "ms",
+                          tint: stat.samples == 0 ? nil : Palette.latency(peak, on: ramp) ?? .primary,
+                          help: peakIsLate ? Explain.maximumLate : Explain.maximum)
                 StatValue(label: "jitter", value: number(stat.jitter), unit: "ms",
                           help: Explain.jitter)
                 Spacer(minLength: 0)
@@ -311,7 +422,7 @@ struct ThroughputCard: View {
     /// switched between an average and one test's numbers was harder to trust
     /// than a thin average that says how thin it is — the subtitle carries the
     /// count, and the sheet lists every run for anyone who wants a specific one.
-    private var shown: (down: Double, up: Double, bloat: Double,
+    private var shown: (down: Double, up: Double, bloat: Double?,
                         ping: Double?, jitter: Double?, loss: Double?) {
         (averages.downloadMbps, averages.uploadMbps, averages.bufferbloatMs,
          averages.loadedLatencyMs, averages.loadedJitterMs, averages.packetLoss)
@@ -332,7 +443,7 @@ struct ThroughputCard: View {
                     accessory: runButton) {
             if hasData {
                 let values = shown
-                let grade = BufferbloatGrade(milliseconds: values.bloat)
+                let grade = values.bloat.map { BufferbloatGrade(milliseconds: $0) }
                 // Six stats do not fit the card at a narrow window, so they
                 // fall to two rows rather than truncating. `fixedSize` goes on
                 // each candidate, not on the `ViewThatFits`: a candidate
@@ -367,9 +478,9 @@ struct ThroughputCard: View {
     }
 
     @ViewBuilder
-    private func speedStats(_ values: (down: Double, up: Double, bloat: Double,
+    private func speedStats(_ values: (down: Double, up: Double, bloat: Double?,
                                        ping: Double?, jitter: Double?, loss: Double?),
-                            _ grade: BufferbloatGrade) -> some View {
+                            _ grade: BufferbloatGrade?) -> some View {
         StatValue(label: "download", value: Fmt.mbps(values.down),
                   unit: "Mbps", tint: Palette.good,
                   help: Explain.download)
@@ -377,8 +488,8 @@ struct ThroughputCard: View {
                   unit: "Mbps", tint: Palette.Chart.internet,
                   help: Explain.upload)
         StatValue(label: "bufferbloat",
-                  value: "+\(Fmt.msCoarse(values.bloat))", unit: "ms",
-                  tint: Palette.grade(grade),
+                  value: values.bloat.map { "+\(Fmt.msCoarse($0))" } ?? "—", unit: "ms",
+                  tint: grade.map(Palette.grade),
                   help: Explain.bufferbloat)
         // Tinted on the same rule the verdict uses, so the card can't shout an
         // orange 2.8% (one drop in thirty-six) while the header says the
@@ -400,16 +511,16 @@ struct ThroughputCard: View {
     /// connection as it always is, which is exactly what the Internet card
     /// already says, over hours instead of a ten-second lead-in.
     @ViewBuilder
-    private func pingStats(_ values: (down: Double, up: Double, bloat: Double,
+    private func pingStats(_ values: (down: Double, up: Double, bloat: Double?,
                                       ping: Double?, jitter: Double?, loss: Double?)) -> some View {
         // "avg ping", not "ping under load": every figure on this card is an
         // average now, and the long labels pushed the row to two lines at any
         // window width. Which load they describe is in the tooltip.
         StatValue(label: "avg ping", value: Fmt.ms(values.ping),
-                  unit: "ms", tint: values.ping.flatMap { Palette.latency($0) },
+                  unit: "ms", tint: values.ping.flatMap { Palette.latency($0, on: .internet) },
                   help: Explain.testAverage)
         StatValue(label: "avg jitter", value: Fmt.ms(values.jitter),
-                  unit: "ms", tint: values.jitter.flatMap { Palette.latency($0) },
+                  unit: "ms", tint: values.jitter.flatMap { Palette.jitter($0) },
                   help: Explain.testJitter)
     }
 
@@ -425,6 +536,41 @@ struct ThroughputCard: View {
                 .font(.caption)
                 .disabled(isTesting)
         )
+    }
+}
+
+/// The WAN as the gateway reports it: the 5G radio's headline figures, and
+/// the way into the Gateway sheet's chart.
+struct GatewayCard: View {
+    let radio: CellularRadio?
+    let problem: String?
+
+    var body: some View {
+        SummaryCard(title: "Gateway", systemImage: "antenna.radiowaves.left.and.right",
+                    subtitle: problem,
+                    accessory: radio.map { r in
+                        AnyView(Chip(text: [r.technology, r.band].compactMap { $0 }
+                                        .joined(separator: " · ")))
+                    }) {
+            if let radio {
+                HStack(alignment: .firstTextBaseline, spacing: Space.m) {
+                    StatValue(label: "SINR", value: Self.db(radio.nrSINR ?? radio.lteSINR),
+                              unit: "dB")
+                    StatValue(label: "RSRP", value: Self.db(radio.nrRSRP ?? radio.lteRSRP),
+                              unit: "dBm")
+                    StatValue(label: "Cell", value: radio.cellID.map(String.init) ?? "—")
+                    Spacer(minLength: 0)
+                }
+            } else {
+                Text(problem == nil ? "Waiting for the gateway…" : "No radio readings")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private static func db(_ value: Double?) -> String {
+        value.map { String(format: "%.1f", $0) } ?? "—"
     }
 }
 
@@ -546,5 +692,46 @@ struct EmptyNote: View {
             .font(.callout)
             .foregroundStyle(.tertiary)
             .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// What this Mac was sending when the connection last went bad.
+///
+/// The headline is the busiest uploader, because that is the answer the card
+/// exists to give. When there wasn't one, the headline says so in words rather
+/// than showing a dash — "nothing on this Mac" is a finding, not a blank.
+struct TrafficCard: View {
+    let captures: [TrafficCapture]
+    var isCapturing = false
+
+    var body: some View {
+        SummaryCard(title: "Traffic", systemImage: "arrow.up.arrow.down",
+                    subtitle: subtitle, help: Explain.trafficCard) {
+            HStack(alignment: .firstTextBaseline, spacing: Space.m) {
+                if let latest = captures.first {
+                    if let top = latest.topUploader {
+                        StatValue(label: "top uploader", value: top.name, unit: "",
+                                  help: Explain.trafficCard)
+                        StatValue(label: "sending", value: Fmt.rate(top.bytesOutPerSecond),
+                                  unit: "", tint: Palette.bad, help: Explain.trafficCard)
+                    } else {
+                        Text("Nothing on this Mac was sending — look at another device.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                } else if isCapturing {
+                    Text("Capturing…")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    private var subtitle: String {
+        let n = captures.count
+        if n == 0 { return "during a latency episode" }
+        return "\(n) capture\(n == 1 ? "" : "s") during latency episodes"
     }
 }

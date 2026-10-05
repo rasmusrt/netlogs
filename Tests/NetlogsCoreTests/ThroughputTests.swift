@@ -34,18 +34,57 @@ final class ThroughputTests: XCTestCase {
 
     // MARK: - Model
 
-    func testBufferbloatMath() {
+    func testBufferbloatMath() throws {
         let r = ThroughputResult(
             downloadMbps: 250, uploadMbps: 60, bytesDownloaded: 1, bytesUploaded: 1,
             idleLatencyMs: 20, downloadLatencyMs: 41, uploadLatencyMs: 500
         )
-        XCTAssertEqual(r.bufferbloatMs, 480, accuracy: 1e-9, "max(41,500) − 20")
+        XCTAssertEqual(try XCTUnwrap(r.bufferbloatMs), 480, accuracy: 1e-9, "max(41,500) − 20")
 
         let clean = ThroughputResult(
             downloadMbps: 100, uploadMbps: 100, bytesDownloaded: 1, bytesUploaded: 1,
             idleLatencyMs: 30, downloadLatencyMs: 25, uploadLatencyMs: 28
         )
         XCTAssertEqual(clean.bufferbloatMs, 0, "never negative")
+    }
+
+    /// The defect schema 5 undoes: an idle window that caught no replies was
+    /// stored as 0 ms, and `max(load) − 0` reported the whole load latency as
+    /// bufferbloat — 210 ms and a "poor" grade out of a window that measured
+    /// nothing.
+    func testUnmeasuredIdleWindowFabricatesNothing() {
+        let r = ThroughputResult(
+            downloadMbps: 250, uploadMbps: 60, bytesDownloaded: 1, bytesUploaded: 1,
+            idleLatencyMs: nil, downloadLatencyMs: 210, uploadLatencyMs: 180
+        )
+        XCTAssertNil(r.bufferbloatMs, "no baseline, no subtraction")
+        XCTAssertNil(r.idleLatencyMs)
+        XCTAssertEqual(try XCTUnwrap(r.loadedLatencyMs), 210, accuracy: 1e-9,
+                       "the load figures were measured and still stand")
+
+        let averages = ThroughputAverages(results: [r])
+        XCTAssertNil(averages.bufferbloatMs)
+        XCTAssertNil(averages.grade, "nothing to grade")
+        XCTAssertNil(averages.latencyMs)
+        XCTAssertEqual(averages.count, 1, "the test still happened")
+
+        // And the verdict cannot call a session bloated on the strength of it.
+        let summary = LiveSummary(
+            internet: PingStat(min: 10, avg: 20, max: 30, jitter: 2,
+                               p50: 20, p95: 25, p99: 28, samples: 600),
+            totalSamples: 600
+        )
+        XCTAssertEqual(SessionVerdict.evaluate(summary: summary, throughput: averages), .good)
+    }
+
+    /// A direction that measured nothing cannot be the heavier one.
+    func testHeavierDirectionIgnoresUnmeasuredWindows() throws {
+        let r = ThroughputResult(
+            downloadMbps: 100, uploadMbps: 10, bytesDownloaded: 1, bytesUploaded: 1,
+            idleLatencyMs: 20, downloadLatencyMs: nil, uploadLatencyMs: 90
+        )
+        XCTAssertEqual(try XCTUnwrap(r.loadedLatencyMs), 90, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(r.bufferbloatMs), 70, accuracy: 1e-9)
     }
 
     func testMeasurementMbps() {
@@ -85,7 +124,7 @@ final class ThroughputTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(two.loadedJitterMs), 8, accuracy: 1e-9)
     }
 
-    func testLoadedFiguresComeFromOneDirection() {
+    func testLoadedFiguresComeFromOneDirection() throws {
         // Upload is the heavier direction here, and its jitter is nil — the
         // pair must not fall back to the download's, which would describe a
         // moment that never happened.
@@ -93,7 +132,7 @@ final class ThroughputTests: XCTestCase {
                                  bytesDownloaded: 1, bytesUploaded: 1,
                                  idleLatencyMs: 20, downloadLatencyMs: 40, uploadLatencyMs: 400,
                                  downloadJitterMs: 5, uploadJitterMs: nil)
-        XCTAssertEqual(r.loadedLatencyMs, 400, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(r.loadedLatencyMs), 400, accuracy: 1e-9)
         XCTAssertNil(r.loadedJitterMs)
     }
 
@@ -101,10 +140,12 @@ final class ThroughputTests: XCTestCase {
 
     func testThroughputTestTagsSamplesAndDerivesBufferbloat() async throws {
         // Samples 0–5 are "idle" (~15 ms); from sample 6 on they're "loaded"
-        // (~220 ms). Keyed on the wire sequence, which is the sample id plus
-        // one — the engine never sends wire sequence 0, because 1.1.1.1 does
-        // not answer it. So wire 1…6 are the first six samples.
-        let pinger = RampPinger(rtt: { seq in seq <= 6 ? 15 : 220 })
+        // (~220 ms). Keyed on the tick rather than the raw wire sequence: the
+        // top bit names the probe (`ProbeHost`), so the internet host's
+        // sequences all start at 0x8000 and a naive `seq <= 6` read every one
+        // of them as loaded. The id is the tick plus one — the engine never
+        // sends wire sequence 0, because 1.1.1.1 does not answer it.
+        let pinger = RampPinger(rtt: { seq in ProbeHost.tick(fromWire: seq) <= 6 ? 15 : 220 })
         let engine = MonitorEngine(
             settings: MonitorSettings(
                 routerHost: "r", internetHost: "i",
@@ -143,9 +184,12 @@ final class ThroughputTests: XCTestCase {
         XCTAssertEqual(result.uploadMbps, 62.2, accuracy: 5)
         XCTAssertEqual(result.isp, "FakeISP")
         XCTAssertEqual(result.serverLocation, "TST")
-        XCTAssertLessThan(result.idleLatencyMs, 60, "idle window caught the ~15 ms pings")
-        XCTAssertGreaterThan(result.downloadLatencyMs, 150, "load window caught the ~220 ms pings")
-        XCTAssertGreaterThan(result.bufferbloatMs, 80, "load latency well above idle")
+        XCTAssertLessThan(try XCTUnwrap(result.idleLatencyMs), 60,
+                          "idle window caught the ~15 ms pings")
+        XCTAssertGreaterThan(try XCTUnwrap(result.downloadLatencyMs), 150,
+                             "load window caught the ~220 ms pings")
+        XCTAssertGreaterThan(try XCTUnwrap(result.bufferbloatMs), 80,
+                             "load latency well above idle")
     }
 
     // MARK: - Storage
@@ -166,7 +210,7 @@ final class ThroughputTests: XCTestCase {
         XCTAssertEqual(try store.throughputCount(for: session.id), 1)
         let back = try XCTUnwrap(try store.throughputResults(for: session.id).first)
         XCTAssertEqual(back.downloadMbps, 248.3, accuracy: 1e-6)
-        XCTAssertEqual(back.bufferbloatMs, 192, accuracy: 1e-6) // recomputed in init
+        XCTAssertEqual(try XCTUnwrap(back.bufferbloatMs), 192, accuracy: 1e-6) // recomputed in init
         XCTAssertEqual(back.serverLocation, "CPH")
     }
 
@@ -262,8 +306,8 @@ final class ThroughputTests: XCTestCase {
         XCTAssertNil(back[1].downloadHighMs, "never measured, so not a zero")
         XCTAssertNil(back[1].idleLowMs)
         XCTAssertNil(back[1].uploadJitterMs)
-        XCTAssertEqual(back[1].downloadLatencyMs, 30, accuracy: 1e-6,
-                       "the always-measured figures are untouched")
+        XCTAssertEqual(try XCTUnwrap(back[1].downloadLatencyMs), 30, accuracy: 1e-6,
+                       "a measured figure is untouched")
     }
 
     func testAveragesIgnoreUnmeasuredResults() {
@@ -287,7 +331,8 @@ final class ThroughputTests: XCTestCase {
         let none = ThroughputAverages(results: [result(jitter: nil, loss: nil)])
         XCTAssertNil(none.jitterMs)
         XCTAssertNil(none.packetLoss)
-        XCTAssertEqual(none.latencyMs, 20, accuracy: 1e-9, "the always-measured figures are untouched")
+        XCTAssertEqual(try XCTUnwrap(none.latencyMs), 20, accuracy: 1e-9,
+                       "a measured figure is untouched")
     }
 
     // MARK: -

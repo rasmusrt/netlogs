@@ -30,20 +30,37 @@ extension View {
         }
     }
 
-    /// Content fades out under the toolbar instead of being cut by a rule.
+    /// Content fades out under the toolbar instead of being cut by a hard
+    /// edge.
     ///
-    /// `.soft`, not `.hard`. Hard draws a defined edge — effectively a stroke —
-    /// and was chosen back when a chart ran to the top of the scroll view and
-    /// needed a clean cut. With the chart gone, the fade is both what the rest
-    /// of the system does (Finder's list slides up under its toolbar) and one
-    /// less line on a screen that had too many.
-    @ViewBuilder
+    /// This is hand-rolled because the platform effect cannot be reached from
+    /// here. macOS 26 draws the edge under a toolbar with an `NSScrollPocket`,
+    /// and there are two of them in this window: one owned by the scroll view,
+    /// which SwiftUI's `scrollEdgeEffectStyle(.soft, for: .top)` does control,
+    /// and one owned by `NSTitlebarBackgroundView`, which sits on top of it,
+    /// renders `NSHardPocketView`, and ignores every SwiftUI modifier —
+    /// applied to the `ScrollView`, to the detail, or to the whole scene. The
+    /// AppKit control for it, `preferredScrollEdgeEffectStyle`, only exists on
+    /// titlebar and split-item *accessory* controllers, and a SwiftUI
+    /// `NavigationSplitView` vends neither.
+    ///
+    /// That hard pocket is also the "1pt rule under the toolbar" that
+    /// `NetlogsScene` hides the toolbar background to be rid of — it was never
+    /// a titlebar separator, which is why `titlebarSeparatorStyle = .none` did
+    /// nothing. Hiding the background removes the pocket, and with it the only
+    /// thing that was covering scrolled content: figures ran straight into the
+    /// window title at full strength. So the fade has to come from us.
+    ///
+    /// The band is transparent for its first two fifths and eases in after
+    /// that, rather than ramping linearly from the very top: a linear fade
+    /// still leaves content at half strength where the title sits, which is
+    /// exactly the collision this is here to fix.
+    ///
+    /// For a scroll view flush with the top of the window, and nothing else:
+    /// the band's height is the window's own chrome inset, so a scroll view
+    /// sitting lower down would be given a fade where no toolbar covers it.
     func fadingTopScrollEdge() -> some View {
-        if #available(macOS 26, *) {
-            scrollEdgeEffectStyle(.soft, for: .top)
-        } else {
-            self
-        }
+        modifier(FadingTopScrollEdge())
     }
 
     /// The standard card surface: an opaque fill and a container shape, no
@@ -80,4 +97,42 @@ extension View {
         if let text, !text.isEmpty { help(text) } else { self }
     }
 
+}
+
+/// See `fadingTopScrollEdge()`.
+private struct FadingTopScrollEdge: ViewModifier {
+    /// Zero until the window has laid its chrome out, and zero forever if the
+    /// reader ever fails — which masks nothing rather than masking wrongly.
+    @State private var inset: CGFloat = 0
+
+    private static let band = Gradient(stops: [
+        .init(color: .clear, location: 0),
+        .init(color: .clear, location: 0.42),
+        .init(color: .black.opacity(0.12), location: 0.60),
+        .init(color: .black.opacity(0.45), location: 0.78),
+        .init(color: .black.opacity(0.85), location: 0.93),
+        .init(color: .black, location: 1),
+    ])
+
+    func body(content: Content) -> some View {
+        content
+            // `ignoresSafeArea` is the whole trick. The `ScrollView`'s own
+            // frame starts *below* the toolbar even though it draws above it,
+            // so a mask laid out in that frame both cuts everything under the
+            // toolbar away and puts the fade 52pt too low — visible as content
+            // dissolving where it should be solid. Ignoring the safe area
+            // gives the mask the drawn region rather than the laid-out one.
+            .mask(alignment: .top) {
+                VStack(spacing: 0) {
+                    LinearGradient(gradient: Self.band,
+                                   startPoint: .top, endPoint: .bottom)
+                        .frame(height: inset)
+                    Color.black
+                }
+                .ignoresSafeArea(edges: .top)
+            }
+            // Outside the mask, so the reader is not masked by its own
+            // measurement.
+            .background(ToolbarInsetReader(inset: $inset).frame(width: 0, height: 0))
+    }
 }

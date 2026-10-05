@@ -32,6 +32,14 @@ final class SessionDetail: Sendable {
     let tableRows: [PingSample]
     /// Same reasoning, for the Network sheet's signal trace.
     let diagnosticsTrace: DiagnosticsTrace
+    /// What this Mac was sending during the session's latency episodes.
+    /// Rare — one per episode at most — so this is the whole list, not a window.
+    let traffic: [TrafficCapture]
+    /// The Gateway sheet's three series, built once here for the same reason
+    /// as `diagnosticsTrace`.
+    let wanTrace: WANTrace
+    /// The last radio the gateway reported, for the Gateway card.
+    let lastRadio: CellularRadio?
 
     init(
         session: SessionState,
@@ -40,8 +48,11 @@ final class SessionDetail: Sendable {
         verdict: SessionVerdict,
         chart: PingChartSeries?,
         throughputAverages: ThroughputAverages,
-        samples: [PingSample]
+        samples: [PingSample],
+        traffic: [TrafficCapture] = [],
+        wan: [WANSnapshot] = []
     ) {
+        self.traffic = traffic
         self.session = session
         self.summary = summary
         self.stats = stats
@@ -51,6 +62,8 @@ final class SessionDetail: Sendable {
         self.samples = samples
         self.tableRows = Array(samples.suffix(samplesTableRenderCap).reversed())
         self.diagnosticsTrace = DiagnosticsTrace.build(summary.diagnostics)
+        self.wanTrace = WANTrace.build(snapshots: wan, samples: samples)
+        self.lastRadio = wan.last { $0.radio != nil }?.radio
     }
 
     var sampleCount: Int { samples.count }
@@ -69,6 +82,8 @@ enum DetailLoader {
             let samples = try store.samples(for: sessionID)
             let throughput = try store.throughputResults(for: sessionID)
             let diagnostics = try store.diagnostics(for: sessionID)
+            let traffic = try store.trafficCaptures(for: sessionID)
+            let wan = try store.wanSnapshots(for: sessionID)
 
             // Everything that judges the session skips the ICMP warm-up
             // samples, exactly as the live path does — otherwise a saved
@@ -99,7 +114,9 @@ enum DetailLoader {
                       )
                     : nil,
                 throughputAverages: averages,
-                samples: samples
+                samples: samples,
+                traffic: traffic,
+                wan: wan
             )
         }.value
     }
@@ -114,7 +131,8 @@ enum DetailLoader {
                 session: session,
                 samples: try store.samples(for: sessionID),
                 throughput: try store.throughputResults(for: sessionID),
-                diagnostics: try store.diagnostics(for: sessionID)
+                diagnostics: try store.diagnostics(for: sessionID),
+                traffic: try store.trafficCaptures(for: sessionID)
             )
         }.value
     }

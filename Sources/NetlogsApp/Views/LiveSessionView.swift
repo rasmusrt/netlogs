@@ -81,6 +81,9 @@ struct LiveSessionView: View {
                     elapsed: controller.stats.elapsed,
                     sampleCount: controller.stats.sampleCount,
                     failureCount: controller.stats.failureCount,
+                    lostCount: controller.stats.summary.noReplyCount,
+                    lateCount: controller.stats.summary.lateCount,
+                    underLoadCount: controller.stats.summary.failuresUnderLoad,
                     status: statusChip,
                     onShowFailures: { sheet = .failures }
                 )
@@ -97,6 +100,11 @@ struct LiveSessionView: View {
                 internetHost: controller.probedHosts?.internet ?? settings.internetHost,
                 throughput: controller.throughput.averages,
                 diagnostics: controller.diagnostics.latest,
+                traffic: controller.traffic.captures,
+                isCapturingTraffic: controller.traffic.isCapturing,
+                showsGateway: controller.wan.isActive,
+                gatewayRadio: controller.wan.radio,
+                gatewayProblem: controller.wan.latest?.failure?.description,
                 isTesting: controller.throughput.isTesting,
                 testingPhase: controller.throughput.phase,
                 onRunTest: { controller.runThroughputTestNow() },

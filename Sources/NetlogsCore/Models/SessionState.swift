@@ -14,19 +14,26 @@ public struct SessionState: Codable, Sendable, Identifiable, Equatable {
     /// Exists so `duration` can be truthful about a session that was never
     /// cleanly stopped. Optional and defaulted so older encoded blobs decode.
     public var lastSampleAt: Date?
+    /// What the session looked like, folded onto its row at `stopSession`
+    /// (schema 6). `nil` while it is still running, and until the backfill has
+    /// reached a session recorded before schema 6 or force-quit before its
+    /// stop. Optional and defaulted so older encoded blobs decode.
+    public var summary: SessionSummary?
 
     public init(
         id: UUID = UUID(),
         startedAt: Date = Date(),
         stoppedAt: Date? = nil,
         settings: MonitorSettings,
-        lastSampleAt: Date? = nil
+        lastSampleAt: Date? = nil,
+        summary: SessionSummary? = nil
     ) {
         self.id = id
         self.startedAt = startedAt
         self.stoppedAt = stoppedAt
         self.settings = settings
         self.lastSampleAt = lastSampleAt
+        self.summary = summary
     }
 
     public var isRunning: Bool { stoppedAt == nil }

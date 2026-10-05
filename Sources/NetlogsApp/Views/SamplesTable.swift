@@ -168,8 +168,10 @@ struct SamplesTable: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .frame(minWidth: ColumnWidths.timeFloor, maxWidth: .infinity, alignment: .leading)
-            RTTCell(ms: sample.routerMs).frame(width: w.rtt, alignment: .leading)
-            RTTCell(ms: sample.internetMs).frame(width: w.rtt, alignment: .leading)
+            RTTCell(ms: sample.routerMs, lateMs: sample.routerLateMs, ramp: .gateway)
+                .frame(width: w.rtt, alignment: .leading)
+            RTTCell(ms: sample.internetMs, lateMs: sample.internetLateMs, ramp: .internet)
+                .frame(width: w.rtt, alignment: .leading)
             // `Spacer`, not a bare `if`: an unfulfilled `if` in a ViewBuilder is
             // an `EmptyView`, and `.frame(width:)` on an `EmptyView` reserves
             // nothing — so on idle rows (almost all of them) the Load column
@@ -227,25 +229,44 @@ struct SamplesTable: View {
 /// the whole point of having a log on screen.
 private struct RTTCell: View {
     let ms: Double?
+    /// RTT of a reply that arrived after the deadline. Rendered as the number
+    /// it is, marked late — the row used to read "timeout", which in this
+    /// column looks identical to a dropped packet and is not one.
+    var lateMs: Double?
+    /// Which leg this column is. The router column and the internet column sit
+    /// side by side, and a shared ramp made the left one almost always green.
+    let ramp: LatencyGrade.Ramp
+
+    init(ms: Double?, lateMs: Double? = nil, ramp: LatencyGrade.Ramp) {
+        self.ms = ms
+        self.lateMs = lateMs
+        self.ramp = ramp
+    }
 
     var body: some View {
         if let ms {
-            let tint = Palette.pill(ms)
-            HStack(alignment: .firstTextBaseline, spacing: 2) {
-                Text(Fmt.ms(ms)).font(.tabularSmall.weight(.medium))
-                Text("ms").font(.system(size: 9))
-            }
-            .foregroundStyle(tint)
-            .padding(.horizontal, Space.s - 1)
-            .padding(.vertical, 2)
-            .background(tint.opacity(Palette.fillOpacity), in: Capsule())
+            pill(ms, tint: Palette.pill(ms, on: ramp), suffix: "ms")
+        } else if let lateMs {
+            // Warning, not critical. The link answered; it answered slowly.
+            pill(lateMs, tint: Palette.bad, suffix: "ms late")
         } else {
-            Text("timeout")
+            Text("no reply")
                 .font(.tabularSmall.weight(.semibold))
                 .foregroundStyle(Palette.critical)
                 .padding(.horizontal, Space.s - 1)
                 .padding(.vertical, 2)
                 .background(Palette.fill(Palette.critical), in: Capsule())
         }
+    }
+
+    private func pill(_ value: Double, tint: Color, suffix: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 2) {
+            Text(Fmt.ms(value)).font(.tabularSmall.weight(.medium))
+            Text(suffix).font(.system(size: 9))
+        }
+        .foregroundStyle(tint)
+        .padding(.horizontal, Space.s - 1)
+        .padding(.vertical, 2)
+        .background(tint.opacity(Palette.fillOpacity), in: Capsule())
     }
 }

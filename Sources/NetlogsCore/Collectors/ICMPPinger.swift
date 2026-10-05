@@ -39,6 +39,9 @@ public final class ICMPPinger: ICMPPinging, @unchecked Sendable {
 
     private let hosts: [String]
     private let timeout: Duration
+    /// How much longer than ``timeout`` a request stays matchable after its
+    /// deadline has passed. See ``ICMPPinger/graceDefault``.
+    private let grace: Duration
     /// Serial queue that is the single synchronization domain for all mutable
     /// state below — send, receive, and timeout all run here.
     private let queue: DispatchQueue
@@ -73,6 +76,9 @@ public final class ICMPPinger: ICMPPinging, @unchecked Sendable {
         let sentAt: DispatchTime
         let continuation: CheckedContinuation<PingOutcome, Never>
         let deadline: DispatchSourceTimer
+        /// Set when `timeout` elapsed and the timer was re-armed for the grace
+        /// window. A reply landing on an expired request is a `.lateReply`.
+        var isExpired = false
     }
 
     static let payloadLength = 56 // classic ping data size → 64-byte packet
@@ -86,9 +92,25 @@ public final class ICMPPinger: ICMPPinging, @unchecked Sendable {
     /// silently reject every reply.
     static let payload: [UInt8] = (0..<payloadLength).map { UInt8(0x40 &+ ($0 & 0x3F)) }
 
-    public init(hosts: [String], timeout: Duration) {
+    /// How long past the deadline a request stays matchable.
+    ///
+    /// Three seconds on top of a two-second timeout, so a round trip is
+    /// measurable out to five. That covers the uplink-queue episodes this
+    /// exists for — observed replies pile up in the 1.5–2.5 s band while a
+    /// saturated upstream drains — without pretending a genuinely dead link is
+    /// still worth waiting on.
+    ///
+    /// The cost is emission latency, not accuracy. `MonitorEngine` releases
+    /// samples in tick order, so a tick that has to run out the full grace
+    /// window holds the ones behind it: during a real outage the live table
+    /// lags five seconds rather than two. That is the whole price, and it buys
+    /// the difference between "lost" and "2.4 s".
+    public static let graceDefault = Duration.seconds(3)
+
+    public init(hosts: [String], timeout: Duration, grace: Duration = ICMPPinger.graceDefault) {
         self.hosts = hosts
         self.timeout = timeout
+        self.grace = grace
         self.queue = DispatchQueue(label: "netlogs.icmp")
     }
 
@@ -141,12 +163,23 @@ public final class ICMPPinger: ICMPPinging, @unchecked Sendable {
                     return
                 }
 
+                // Two-stage deadline. The first firing is the timeout proper;
+                // it does not resolve the request, it marks it expired and
+                // re-arms for the grace window, so a reply that is merely late
+                // still finds a home in `pending` and comes back with its real
+                // RTT. The second firing is the one that gives up.
                 let deadline = DispatchSource.makeTimerSource(queue: queue)
                 deadline.schedule(deadline: .now() + .nanoseconds(timeout.wholeNanoseconds))
                 deadline.setEventHandler { [self] in
-                    guard let p = pending.removeValue(forKey: key) else { return }
-                    p.deadline.cancel()
-                    p.continuation.resume(returning: .timeout)
+                    guard let p = pending[key] else { return }
+                    if p.isExpired || grace <= .zero {
+                        pending.removeValue(forKey: key)
+                        p.deadline.cancel()
+                        p.continuation.resume(returning: .timeout)
+                    } else {
+                        pending[key]?.isExpired = true
+                        p.deadline.schedule(deadline: .now() + .nanoseconds(grace.wholeNanoseconds))
+                    }
                 }
                 pending[key] = Pending(sentAt: sentAt, continuation: continuation, deadline: deadline)
                 deadline.resume()
@@ -286,7 +319,8 @@ public final class ICMPPinger: ICMPPinging, @unchecked Sendable {
         p.deadline.cancel()
 
         let elapsedNs = DispatchTime.now().uptimeNanoseconds &- p.sentAt.uptimeNanoseconds
-        p.continuation.resume(returning: .reply(rttMs: Double(elapsedNs) / 1_000_000))
+        let rttMs = Double(elapsedNs) / 1_000_000
+        p.continuation.resume(returning: p.isExpired ? .lateReply(rttMs: rttMs) : .reply(rttMs: rttMs))
     }
 
     /// The wire sequence of `buffer[0..<count]` if it is an echo reply to one

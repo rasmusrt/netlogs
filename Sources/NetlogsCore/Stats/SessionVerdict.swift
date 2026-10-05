@@ -44,6 +44,7 @@ public enum SessionVerdict: String, Sendable, Equatable, Hashable, CaseIterable,
     case good
     case jittery
     case bloated
+    case routerLossy
     case lossy
     case offline
 
@@ -72,6 +73,7 @@ public enum SessionVerdict: String, Sendable, Equatable, Hashable, CaseIterable,
         case .good:             return "Connection healthy"
         case .jittery:          return "Unstable latency"
         case .bloated:          return "Bufferbloat under load"
+        case .routerLossy:      return "Router dropping packets"
         case .lossy:            return "Dropping packets"
         case .offline:          return "Connection down"
         }
@@ -83,6 +85,7 @@ public enum SessionVerdict: String, Sendable, Equatable, Hashable, CaseIterable,
         case .good:             return "checkmark.circle.fill"
         case .jittery:          return "waveform.path"
         case .bloated:          return "arrow.down.right.and.arrow.up.left"
+        case .routerLossy:      return "wifi.exclamationmark"
         case .lossy:            return "exclamationmark.triangle.fill"
         case .offline:          return "bolt.horizontal.circle.fill"
         }
@@ -95,6 +98,10 @@ public enum SessionVerdict: String, Sendable, Equatable, Hashable, CaseIterable,
         case .insufficientData: return 0
         case .good:             return 0
         case .jittery:          return 1
+        // Warn, not bad. The internet is reachable and the numbers describing
+        // it are sound; what is broken is the first hop, which the user can
+        // usually do something about.
+        case .routerLossy:      return 1
         case .bloated:          return 2
         case .lossy:            return 2
         case .offline:          return 3
@@ -108,22 +115,60 @@ public enum SessionVerdict: String, Sendable, Equatable, Hashable, CaseIterable,
     ) -> SessionVerdict {
         guard summary.totalSamples >= minimumSamples else { return .insufficientData }
 
-        let lossRatio = Double(summary.failureCount) / Double(summary.totalSamples)
+        // `internetTimeouts`, not `failureCount`. The latter counts a sample
+        // where *either* host was silent (LiveSummary), so a gateway that drops
+        // ICMP scored as connection loss: "Connection down, 600 of 600 pings
+        // lost" beside an Internet card showing 600 replies at 13 ms. That
+        // inverts the router-versus-internet distinction the whole app exists
+        // to draw. `ThroughputCard` had the same bug and was fixed; this is the
+        // same fix, one layer down.
+        // `internetNoRepliesIdle`, not `internetTimeouts`. Two exclusions, and
+        // both of them changed a real verdict on real data:
+        //
+        // - A reply that arrives at 2.4 s against a 2 s timeout is not a lost
+        //   packet. An eleven-hour session graded itself on 14 "lost" pings
+        //   whose maximum recorded RTT was 1942 ms — the distribution was
+        //   clipped at the deadline and every one of the 14 was still in
+        //   flight. Counting those as loss is counting the timeout setting.
+        // - A ping that missed its deadline because this app was saturating the
+        //   uplink measures this app, not the link. Three of that session's
+        //   five failure clusters started eleven seconds into a scheduled
+        //   upload test. Grading the network on them is grading our own load
+        //   generator.
+        //
+        // What is left is the number to take to an ISP: the internet host was
+        // asked, on an unloaded link, and said nothing for five seconds.
+        let internetLoss = Double(summary.internetNoRepliesIdle) / Double(summary.totalSamples)
 
         // Never once reached the internet host: down, regardless of the ratio.
         if summary.internet.samples == 0 { return .offline }
 
-        if summary.failureCount >= minimumFailuresToReport {
-            if lossRatio >= offlineLossRatio { return .offline }
-            if lossRatio >= lossyLossRatio { return .lossy }
+        if summary.internetNoRepliesIdle >= minimumFailuresToReport {
+            if internetLoss >= offlineLossRatio { return .offline }
+            if internetLoss >= lossyLossRatio { return .lossy }
         }
 
+        // `grade` is nil when no test measured both an idle baseline and a
+        // loaded window. An unmeasured baseline used to read as 0 ms, which
+        // made the whole load latency look like bufferbloat and could put a
+        // session in `.bloated` on the strength of nothing.
         if let throughput, throughput.count > 0,
-           BufferbloatGrade(milliseconds: throughput.bufferbloatMs) >= .poor {
+           let grade = throughput.grade, grade >= .poor {
             return .bloated
         }
 
         if summary.internet.jitter > jitterThresholdMs { return .jittery }
+
+        // Checked last, and it has to be checked: with loss now measured on the
+        // internet host alone, a router dropping every packet would otherwise
+        // fall through to "Connection healthy, no loss" — a quieter lie than
+        // the one above it, told beside a Failures tab full of timeouts.
+        let routerNoReplies = summary.routerNoReplies
+        let routerLoss = Double(routerNoReplies) / Double(summary.totalSamples)
+        if routerNoReplies >= minimumFailuresToReport,
+           routerLoss >= lossyLossRatio {
+            return .routerLossy
+        }
 
         return .good
     }
@@ -141,24 +186,43 @@ public enum SessionVerdict: String, Sendable, Equatable, Hashable, CaseIterable,
             // Below the reporting threshold is not the same as none, and
             // claiming "no loss" beside a non-empty Failures tab is the kind of
             // small lie that costs trust in everything else on screen.
-            let dropped = summary.failureCount
-            let tail = dropped == 0
-                ? "no loss"
-                : "\(dropped) dropped of \(summary.totalSamples.formatted())"
-            return String(format: "%.0f ms average", summary.internet.avg) + ", " + tail
+            // Three distinct facts, and the old text collapsed them into one
+            // word. "Dropped" now means dropped; a reply that came back over
+            // the deadline is named as slow, and a timeout we caused ourselves
+            // with a speed test is named as ours. Saying "12 dropped" for a
+            // session that lost nothing is the small lie that sent a user to
+            // argue with an ISP about a link that was working.
+            let lost = summary.noReplyCount
+            let late = summary.lateCount
+            let tail: String
+            if lost == 0, late == 0 {
+                tail = "no loss"
+            } else if lost == 0 {
+                tail = "no loss, \(late) slow repl\(late == 1 ? "y" : "ies")"
+            } else {
+                tail = "\(lost) dropped of \(summary.totalSamples.formatted())"
+            }
+            let selfInflicted = summary.failuresUnderLoad
+            let note = selfInflicted > 0
+                ? " (\(selfInflicted) during speed tests)" : ""
+            return String(format: "%.0f ms average", summary.internet.avg) + ", " + tail + note
         case .jittery:
             return String(format: "%.0f ms jitter between replies", summary.internet.jitter)
         case .bloated:
             let ms = throughput?.bufferbloatMs ?? 0
             return String(format: "latency rises %.0f ms under load", ms)
+        case .routerLossy:
+            return "\(summary.routerNoReplies) of \(summary.totalSamples) pings to the "
+                + "router lost, internet unaffected"
         case .lossy:
-            let pct = Double(summary.failureCount) / Double(max(summary.totalSamples, 1)) * 100
+            let lost = summary.internetNoRepliesIdle
+            let pct = Double(lost) / Double(max(summary.totalSamples, 1)) * 100
             return String(format: "%.1f%% of pings lost (%d of %d)",
-                          pct, summary.failureCount, summary.totalSamples)
+                          pct, lost, summary.totalSamples)
         case .offline:
             return summary.internet.samples == 0
                 ? "no reply from the internet host"
-                : "\(summary.failureCount) of \(summary.totalSamples) pings lost"
+                : "\(summary.internetNoRepliesIdle) of \(summary.totalSamples) pings lost"
         }
     }
 }

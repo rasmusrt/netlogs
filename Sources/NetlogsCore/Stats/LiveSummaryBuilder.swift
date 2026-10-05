@@ -9,6 +9,12 @@ public struct LiveSummaryBuilder: Sendable {
     private var routerTimeouts = 0
     private var internetTimeouts = 0
     private var failed = 0
+    private var noReply = 0
+    private var late = 0
+    private var failedUnderLoad = 0
+    private var routerLate = LateReplies()
+    private var internetLate = LateReplies()
+    private var internetSilentIdle = 0
 
     public private(set) var firstSampleAt: Date?
     public private(set) var lastSampleAt: Date?
@@ -20,13 +26,26 @@ public struct LiveSummaryBuilder: Sendable {
         if firstSampleAt == nil { firstSampleAt = sample.timestamp }
         lastSampleAt = sample.timestamp
 
+        // A late reply is still a gap for the *timely* stat — it did not
+        // arrive in time, so `markGap` is correct and jitter must not difference
+        // across it. Its RTT is recorded separately, in `LateReplies`.
         if let ms = sample.routerMs { router.record(rttMs: ms) }
         else { router.recordTimeout(); routerTimeouts += 1 }
+        if let ms = sample.routerLateMs { routerLate.record(rttMs: ms) }
 
         if let ms = sample.internetMs { internet.record(rttMs: ms) }
         else { internet.recordTimeout(); internetTimeouts += 1 }
+        if let ms = sample.internetLateMs { internetLate.record(rttMs: ms) }
+        if sample.internetNoReply, !sample.isUnderLoad { internetSilentIdle += 1 }
 
-        if sample.routerMs == nil || sample.internetMs == nil { failed += 1 }
+        if sample.routerTimedOut || sample.internetTimedOut {
+            failed += 1
+            if sample.isUnderLoad { failedUnderLoad += 1 }
+            // A sample can be both — one host silent, the other merely late —
+            // and it belongs in `noReply`. "At least one host sent nothing" is
+            // the stricter fact and the one that means a packet was lost.
+            if sample.routerNoReply || sample.internetNoReply { noReply += 1 } else { late += 1 }
+        }
     }
 
     public var summary: LiveSummary {
@@ -36,7 +55,13 @@ public struct LiveSummaryBuilder: Sendable {
             totalSamples: total,
             routerTimeouts: routerTimeouts,
             internetTimeouts: internetTimeouts,
-            failureCount: failed
+            failureCount: failed,
+            noReplyCount: noReply,
+            lateCount: late,
+            failuresUnderLoad: failedUnderLoad,
+            routerLate: routerLate,
+            internetLate: internetLate,
+            internetNoRepliesIdle: internetSilentIdle
         )
     }
 

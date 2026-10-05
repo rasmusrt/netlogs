@@ -46,6 +46,9 @@ struct SavedSessionView: View {
                 elapsed: session.duration,
                 sampleCount: detail.sampleCount,
                 failureCount: detail.stats.failureCount,
+                lostCount: detail.stats.noReplyCount,
+                lateCount: detail.stats.lateCount,
+                underLoadCount: detail.stats.failuresUnderLoad,
                 onShowFailures: { sheet = .failures }
             )
         } content: {
@@ -55,6 +58,9 @@ struct SavedSessionView: View {
                 internetHost: session.settings.internetHost,
                 throughput: detail.throughputAverages,
                 diagnostics: detail.summary.diagnostics.last,
+                traffic: detail.traffic,
+                showsGateway: detail.wanTrace.snapshotCount > 0,
+                gatewayRadio: detail.lastRadio,
                 onSelect: { sheet = $0 }
             )
             // CHART DISABLED:

@@ -26,6 +26,29 @@ It holds, per monitoring session:
   noise, transmit rate, channel, band, protocol and security type. Stored when
   something changes, plus once a minute.
 
+- **Traffic captures** — the names, process IDs and byte rates of programs
+  running **on this Mac** that were sending or receiving data at moments when
+  your connection went slow. Taken by running the system's `nettop` command
+  once, at most one capture every ten minutes, and only while the internet is
+  slow *and* your router is responding normally — the moment where knowing what
+  was uploading actually explains something.
+
+  This is the only thing Netlogs records that is about your Mac rather than
+  about your connection, so it has its own switch: **Settings → Traffic
+  capture**, and turning it off stops the captures entirely. It sees this Mac
+  only — no other device on your network appears — and, like everything else
+  here, it is stored locally and sent nowhere. It *is* included in session
+  exports, so check an export before sharing it if that matters to you.
+
+- **Gateway telemetry** — only if you turn it on under **Settings → Gateway
+  telemetry**. Netlogs then asks your own UniFi gateway, on your local network,
+  for the 5G radio's signal figures (signal quality, band, cell) and the byte
+  counters on its internet connection. It stores only those figures. The
+  gateway also reports the modem's IMEI and the SIM's ICCID, and Netlogs drops
+  them rather than storing them. The API key you give it is kept in your
+  Keychain. It is only sent to the gateway, and only after you have trusted
+  that gateway's certificate. Nothing is sent to Ubiquiti or anywhere else.
+
 Your Wi-Fi network name (SSID) and access point address (BSSID) are **not**
 recorded: macOS 26 does not make them available to apps without a special
 entitlement, and Netlogs does not have one.

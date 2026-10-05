@@ -44,7 +44,46 @@ struct SettingsScreen: View {
     /// what the duplicate-host warning compares.
     @State private var detectedGateway: String? = MacDiagnostics.defaultGateway()
 
+    /// Tabs, not one form. One grouped form had grown to 1,254 pt, taller
+    /// than the laptop screen it runs on, with the newest section below the
+    /// fold. The grouping follows what a setting is for: what gets measured,
+    /// the speed test, and the three sources that explain a slow moment.
     var body: some View {
+        TabView {
+            Tab("General", systemImage: "gearshape") { general }
+            Tab("Monitoring", systemImage: "waveform.path.ecg") { monitoring }
+            Tab("Speed Test", systemImage: "speedometer") { speedTest }
+            Tab("Diagnostics", systemImage: "stethoscope") { diagnostics }
+        }
+        .frame(width: 470)
+        .fixedSize(horizontal: false, vertical: true)
+        .task { dbBytes = store?.databaseByteCount() ?? 0 }
+        .onAppear { detectedGateway = MacDiagnostics.defaultGateway() }
+    }
+
+    private var general: some View {
+        Form {
+            Section("Appearance") {
+                Picker("Theme", selection: $settings.theme) {
+                    ForEach(AppTheme.allCases) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.segmented)
+            }
+            Section("Storage") {
+                Picker("Keep stopped sessions", selection: $settings.retentionDays) {
+                    Text("Forever").tag(0)
+                    Text("7 days").tag(7)
+                    Text("30 days").tag(30)
+                    Text("90 days").tag(90)
+                }
+                LabeledContent("Database size",
+                               value: ByteCountFormatter.string(fromByteCount: Int64(dbBytes), countStyle: .file))
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var monitoring: some View {
         Form {
             Section("Hosts") {
                 Toggle("Detect router automatically",
@@ -60,7 +99,6 @@ struct SettingsScreen: View {
                         .foregroundStyle(.secondary)
                 }
                 TextField("Internet host", text: $settings.monitor.internetHost)
-
                 // A warning, not a rejection. The configuration is legal and
                 // the app still runs; it just cannot produce a meaningful
                 // reading, and the way it fails — phantom packet loss — looks
@@ -79,7 +117,6 @@ struct SettingsScreen: View {
                     .foregroundStyle(Palette.bad)
                 }
             }
-
             Section("Ping") {
                 Picker("Interval", selection: pingInterval) {
                     Text("0.5 s").tag(0.5)
@@ -88,7 +125,12 @@ struct SettingsScreen: View {
                     Text("5 s").tag(5.0)
                 }
             }
+        }
+        .formStyle(.grouped)
+    }
 
+    private var speedTest: some View {
+        Form {
             Section("Throughput") {
                 Toggle("Run periodic tests", isOn: $settings.monitor.throughputEnabled)
                 Picker("Run every", selection: $settings.monitor.throughputInterval) {
@@ -98,38 +140,31 @@ struct SettingsScreen: View {
                 Text("Each test transfers ~200 MB against Cloudflare's speed endpoints.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+        }
+        .formStyle(.grouped)
+    }
 
-            Section("Diagnostics") {
+    private var diagnostics: some View {
+        Form {
+            Section("Wi-Fi") {
                 Picker("Poll interval", selection: diagInterval) {
                     Text("2 s").tag(2.0)
                     Text("5 s").tag(5.0)
                     Text("10 s").tag(10.0)
                 }
             }
-
-            Section("Appearance") {
-                Picker("Theme", selection: $settings.theme) {
-                    ForEach(AppTheme.allCases) { Text($0.label).tag($0) }
-                }
-                .pickerStyle(.segmented)
+            Section("Traffic capture") {
+                Toggle("Record what this Mac is sending during slow moments",
+                       isOn: $settings.monitor.trafficCaptureEnabled)
+                Text("When the internet goes slow while the router stays fast, "
+                     + "Netlogs runs `nettop` once and stores which processes "
+                     + "were sending. This Mac only, stored locally, at most "
+                     + "one capture every ten minutes.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-
-            Section("Storage") {
-                Picker("Keep stopped sessions", selection: $settings.retentionDays) {
-                    Text("Forever").tag(0)
-                    Text("7 days").tag(7)
-                    Text("30 days").tag(30)
-                    Text("90 days").tag(90)
-                }
-                LabeledContent("Database size",
-                               value: ByteCountFormatter.string(fromByteCount: Int64(dbBytes), countStyle: .file))
-            }
+            GatewaySettingsSection(settings: settings, routerHost: effectiveRouterHost)
         }
         .formStyle(.grouped)
-        .frame(width: 470)
-        .fixedSize(horizontal: false, vertical: true)
-        .task { dbBytes = store?.databaseByteCount() ?? 0 }
-        .onAppear { detectedGateway = MacDiagnostics.defaultGateway() }
     }
 
     // MARK: - Bindings that translate Duration / side effects

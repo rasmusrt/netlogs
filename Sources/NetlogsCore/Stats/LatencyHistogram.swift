@@ -29,6 +29,40 @@ public struct LatencyHistogram: Sendable, Equatable {
         count += 1
     }
 
+    /// Bulk insert of a bucket that was counted elsewhere — the shape a
+    /// `GROUP BY CAST(ms AS INTEGER)` returns.
+    ///
+    /// This is what lets the Analysis screen build percentiles in SQLite
+    /// without constructing a `PingSample`, while still going through the same
+    /// nearest-rank rule the live path uses. Two implementations of a
+    /// percentile would be two chances to disagree.
+    public mutating func add(_ milliseconds: Double, count occurrences: Int) {
+        guard occurrences > 0 else { return }
+        let index: Int
+        if milliseconds >= 1000 {
+            index = Self.overflowIndex
+        } else if milliseconds <= 0 {
+            index = 0
+        } else {
+            index = Int(milliseconds)
+        }
+        buckets[index] += occurrences
+        count += occurrences
+    }
+
+    /// One histogram covering every input — for a range's percentiles, which
+    /// are over all of its sessions rather than an average of theirs.
+    public static func merging(_ histograms: [LatencyHistogram]) -> LatencyHistogram {
+        var out = LatencyHistogram()
+        for histogram in histograms {
+            for index in 0..<Self.bucketCount where histogram.buckets[index] > 0 {
+                out.buckets[index] += histogram.buckets[index]
+                out.count += histogram.buckets[index]
+            }
+        }
+        return out
+    }
+
     /// Nearest-rank percentile in milliseconds. `p` is 0…100.
     /// The overflow bucket reports as 1000. Returns 0 when empty.
     public func percentile(_ p: Double) -> Double {

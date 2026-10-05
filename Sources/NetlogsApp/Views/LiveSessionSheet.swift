@@ -31,7 +31,9 @@ final class LiveSheetLoader {
     /// from disk meant a full session read and reduce to show rows that were
     /// already in memory, with the newest one possibly not flushed yet.
     func load(sheet: SessionSheet, store: SessionStore, sessionID: UUID) async {
-        guard sheet == .latency else { return }
+        // Gateway too: its chart lines the gateway's readings up against every
+        // ping, and the pings are only on disk.
+        guard sheet == .latency || sheet == .gateway else { return }
         if detail != nil, loadedSession == sessionID,
            let at = loadedAt, Date().timeIntervalSince(at) < Self.freshness { return }
 
@@ -64,6 +66,8 @@ struct LiveSessionSheet: View {
             liveTrace: controller.diagnostics.trace,
             liveFailures: controller.failures.newestFirst,
             liveFailureTotal: controller.failures.total,
+            liveTraffic: controller.traffic.captures,
+            liveCapturing: controller.traffic.isCapturing,
             liveThroughput: controller.throughput.results,
             liveAverages: controller.throughput.averages,
             isLoading: loader.isLoading

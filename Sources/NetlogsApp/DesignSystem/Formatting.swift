@@ -65,4 +65,21 @@ enum Fmt {
         if mb >= 1000 { return String(format: "%.1f GB", mb / 1000) }
         return String(format: "%.0f MB", mb)
     }
+
+    /// A traffic rate: "4.2 MB/s", "310 kB/s", "—" for nothing.
+    ///
+    /// Bytes per second, not bits, because that is what `nettop` reports and
+    /// converting would invite the reader to compare it against a line speed
+    /// quoted in Mbps — which is a real comparison worth making, but not one to
+    /// make silently by changing units behind their back.
+    static func rate(_ bytesPerSecond: Double) -> String {
+        guard bytesPerSecond >= 1 else { return "—" }
+        if bytesPerSecond >= 1_000_000 {
+            return String(format: "%.1f MB/s", bytesPerSecond / 1_000_000)
+        }
+        if bytesPerSecond >= 1_000 {
+            return String(format: "%.0f kB/s", bytesPerSecond / 1_000)
+        }
+        return String(format: "%.0f B/s", bytesPerSecond)
+    }
 }

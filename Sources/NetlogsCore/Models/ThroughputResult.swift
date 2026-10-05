@@ -15,13 +15,25 @@ public struct ThroughputResult: Codable, Identifiable, Sendable, Equatable {
     public let bytesUploaded: Int
 
     /// Internet-host RTT, idle window just before the test.
-    public let idleLatencyMs: Double
-    /// Internet-host RTT while `.downloading`.
-    public let downloadLatencyMs: Double
-    /// Internet-host RTT while `.uploading`.
-    public let uploadLatencyMs: Double
+    ///
+    /// `nil` means *not measured* — an idle window where no ping got a reply.
+    /// It used to be stored as `0`, which made the subtraction below report the
+    /// entire load latency as bufferbloat: 210 ms and a "poor" grade invented
+    /// out of a window that measured nothing. Same mistake as schema 2's
+    /// `NOT NULL DEFAULT 0`, in the field the Speed card leads with.
+    public let idleLatencyMs: Double?
+    /// Internet-host RTT while `.downloading`, or `nil` if that window caught
+    /// no replies.
+    public let downloadLatencyMs: Double?
+    /// Internet-host RTT while `.uploading`, or `nil` if that window caught no
+    /// replies.
+    public let uploadLatencyMs: Double?
     /// `max(downloadLatencyMs, uploadLatencyMs) − idleLatencyMs`, floored at 0.
-    public let bufferbloatMs: Double
+    ///
+    /// `nil` unless both halves of that subtraction were measured. A number
+    /// derived from an unmeasured baseline is not a smaller number; it is not
+    /// a measurement at all.
+    public let bufferbloatMs: Double?
     /// Internet-host jitter over the same idle window as `idleLatencyMs`, on the
     /// same definition as `RunningStats.measuredJitter` — the mean absolute
     /// difference between consecutive replies.
@@ -71,9 +83,9 @@ public struct ThroughputResult: Codable, Identifiable, Sendable, Equatable {
         uploadMbps: Double,
         bytesDownloaded: Int,
         bytesUploaded: Int,
-        idleLatencyMs: Double,
-        downloadLatencyMs: Double,
-        uploadLatencyMs: Double,
+        idleLatencyMs: Double?,
+        downloadLatencyMs: Double?,
+        uploadLatencyMs: Double?,
         idleJitterMs: Double? = nil,
         packetLoss: Double? = nil,
         idleLowMs: Double? = nil,
@@ -96,7 +108,11 @@ public struct ThroughputResult: Codable, Identifiable, Sendable, Equatable {
         self.idleLatencyMs = idleLatencyMs
         self.downloadLatencyMs = downloadLatencyMs
         self.uploadLatencyMs = uploadLatencyMs
-        self.bufferbloatMs = max(0, max(downloadLatencyMs, uploadLatencyMs) - idleLatencyMs)
+        // Derived only from what was measured: the heavier direction needs at
+        // least one load window, and the subtraction needs the baseline.
+        let loaded = [downloadLatencyMs, uploadLatencyMs].compactMap { $0 }.max()
+        self.bufferbloatMs = (loaded == nil || idleLatencyMs == nil)
+            ? nil : max(0, loaded! - idleLatencyMs!)
         self.idleJitterMs = idleJitterMs
         self.packetLoss = packetLoss
         self.idleLowMs = idleLowMs
@@ -115,7 +131,17 @@ public struct ThroughputResult: Codable, Identifiable, Sendable, Equatable {
 
     /// Whether the download direction loaded the connection harder. The same
     /// choice ``bufferbloatMs`` is derived from.
-    private var downloadWasHeavier: Bool { downloadLatencyMs >= uploadLatencyMs }
+    /// Which direction loaded the connection harder. A direction that measured
+    /// nothing cannot be the heavier one; if neither measured, the choice is
+    /// arbitrary and both readings below are `nil` anyway.
+    private var downloadWasHeavier: Bool {
+        switch (downloadLatencyMs, uploadLatencyMs) {
+        case let (dl?, ul?): return dl >= ul
+        case (_?, nil):      return true
+        case (nil, _?):      return false
+        case (nil, nil):     return true
+        }
+    }
 
     /// Round-trip time while the connection was loaded — the worse of the two
     /// directions.
@@ -123,7 +149,7 @@ public struct ThroughputResult: Codable, Identifiable, Sendable, Equatable {
     /// This and ``loadedJitterMs`` come from the *same* direction on purpose.
     /// Taking the worst latency from one and the worst jitter from the other
     /// would describe a moment that never happened.
-    public var loadedLatencyMs: Double {
+    public var loadedLatencyMs: Double? {
         downloadWasHeavier ? downloadLatencyMs : uploadLatencyMs
     }
 
@@ -138,11 +164,14 @@ public struct ThroughputAverages: Codable, Sendable, Equatable {
     public var count: Int
     public var downloadMbps: Double
     public var uploadMbps: Double
-    public var bufferbloatMs: Double
+    /// `nil` when no test in the set measured both an idle baseline and a
+    /// loaded window — the same rule as `jitterMs` below, applied to the figure
+    /// the card leads with.
+    public var bufferbloatMs: Double?
     /// Latency, jitter and loss measured during the tests themselves — not the
     /// session-wide ping stats, which describe a different host over a
     /// different span.
-    public var latencyMs: Double
+    public var latencyMs: Double?
     /// Averaged over the tests that *measured* it, and `nil` when none did —
     /// the same rule the ping cards use, where the mean is over replies rather
     /// than over samples. A set mixing measured and unmeasured tests averages
@@ -159,8 +188,8 @@ public struct ThroughputAverages: Codable, Sendable, Equatable {
 
     public init(
         count: Int = 0,
-        downloadMbps: Double = 0, uploadMbps: Double = 0, bufferbloatMs: Double = 0,
-        latencyMs: Double = 0, jitterMs: Double? = nil, packetLoss: Double? = nil,
+        downloadMbps: Double = 0, uploadMbps: Double = 0, bufferbloatMs: Double? = nil,
+        latencyMs: Double? = nil, jitterMs: Double? = nil, packetLoss: Double? = nil,
         loadedLatencyMs: Double? = nil, loadedJitterMs: Double? = nil
     ) {
         self.count = count
@@ -201,16 +230,22 @@ public struct ThroughputAverages: Codable, Sendable, Equatable {
             count: results.count,
             downloadMbps: results.reduce(0) { $0 + $1.downloadMbps } / n,
             uploadMbps: results.reduce(0) { $0 + $1.uploadMbps } / n,
-            bufferbloatMs: results.reduce(0) { $0 + $1.bufferbloatMs } / n,
-            latencyMs: results.reduce(0) { $0 + $1.idleLatencyMs } / n,
+            // Every figure averages the tests that measured it, and reports
+            // nothing when none did. Dividing a sum of measured values by the
+            // count of *all* tests — which is what these three used to do —
+            // quietly counts an unmeasured window as a zero.
+            bufferbloatMs: mean(results.compactMap(\.bufferbloatMs)),
+            latencyMs: mean(results.compactMap(\.idleLatencyMs)),
             jitterMs: mean(results.compactMap(\.idleJitterMs)),
             packetLoss: mean(results.compactMap(\.packetLoss)),
-            loadedLatencyMs: mean(results.map(\.loadedLatencyMs)),
+            loadedLatencyMs: mean(results.compactMap(\.loadedLatencyMs)),
             loadedJitterMs: mean(results.compactMap(\.loadedJitterMs))
         )
     }
 
-    public var grade: BufferbloatGrade {
-        BufferbloatGrade(milliseconds: bufferbloatMs)
+    /// `nil` when bufferbloat was never measured, so a card can show "—"
+    /// rather than grading a number that does not exist.
+    public var grade: BufferbloatGrade? {
+        bufferbloatMs.map { BufferbloatGrade(milliseconds: $0) }
     }
 }

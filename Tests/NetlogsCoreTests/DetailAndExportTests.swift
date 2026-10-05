@@ -103,14 +103,20 @@ final class DetailAndExportTests: XCTestCase {
         return SessionExport(session: session, samples: samples, throughput: tp, diagnostics: diag)
     }
 
-    func testCSVShape() {
+    func testCSVShape() throws {
         let e = makeExport(sampleCount: 100)
         let csv = SessionExporter.csv(e)
         let lines = csv.split(separator: "\n", omittingEmptySubsequences: false)
-        XCTAssertEqual(lines.first, "seq,timestamp,router_ms,internet_ms,phase")
+        XCTAssertEqual(lines.first,
+                       "seq,timestamp,router_ms,internet_ms,router_late_ms,internet_late_ms,phase")
         XCTAssertEqual(lines.count, 100 + 1 + 1) // header + rows + trailing newline
         XCTAssertTrue(lines[1].hasPrefix("0,"))
-        XCTAssertTrue(csv.contains(",,")) // a timeout row leaves router_ms blank
+        // Every row leaves both late columns blank here — the fixture's
+        // timeouts are true losses. A row with a blank `router_ms` and a number
+        // in `router_late_ms` is the case this file exists to keep distinct.
+        XCTAssertEqual(lines[1].split(separator: ",", omittingEmptySubsequences: false).count, 7)
+        let timeoutRow = try XCTUnwrap(lines.first { $0.hasPrefix("30,") })
+        XCTAssertTrue(timeoutRow.contains(",,"), "a lost row leaves router_ms blank")
     }
 
     func testJSONRoundTrips() throws {
@@ -140,14 +146,20 @@ final class DetailAndExportTests: XCTestCase {
     }
 
     func testTextReportListsEachFailureWithTimestamp() {
-        // makeExport drops the router reply on every 30th sample.
+        // makeExport drops the router reply on every 30th sample: ids 0, 30,
+        // …, 270. Nine of them are reported, not ten — id 0 is inside the
+        // warm-up window (`PingSample.warmupSampleCount`), which the screens do
+        // not judge and neither does the report.
         let e = makeExport(sampleCount: 300)
         let txt = SessionExporter.text(e)
-        XCTAssertTrue(txt.contains("PING FAILURES (10)"))
-        XCTAssertTrue(txt.contains("FAILED"))
+        XCTAssertTrue(txt.contains("MISSED DEADLINES (9)"))
+        // "LOST", not "FAILED": the fixture drops the reply outright, with no
+        // late arrival, so these really are lost packets and the report is
+        // entitled to say so. A late reply prints its round-trip time instead.
+        XCTAssertTrue(txt.contains("LOST"))
         // One row per failure, plus header + rule + section title lines.
-        let failedRows = txt.split(separator: "\n").filter { $0.contains("FAILED") }
-        XCTAssertEqual(failedRows.count, 10)
+        let failedRows = txt.split(separator: "\n").filter { $0.contains("LOST") }
+        XCTAssertEqual(failedRows.count, 9)
     }
 
     func testFailuresOnlyTextIsTrimmedAndDiffersFromFull() {
@@ -156,13 +168,13 @@ final class DetailAndExportTests: XCTestCase {
         let only = SessionExporter.text(e, failuresOnly: true)
         XCTAssertNotEqual(full, only, "the two scopes used to render the same page")
         // Failures-only keeps the header and the failure log, nothing else.
-        XCTAssertTrue(only.contains("PING FAILURES (10)"))
-        XCTAssertTrue(only.contains("FAILED"))
+        XCTAssertTrue(only.contains("MISSED DEADLINES (9)"))
+        XCTAssertTrue(only.contains("LOST"))
         XCTAssertFalse(only.contains("PING SUMMARY"))
         XCTAssertFalse(only.contains("THROUGHPUT"))
         XCTAssertFalse(only.contains("DIAGNOSTICS"))
         // The full report still carries the same failure log.
-        XCTAssertTrue(full.contains("PING FAILURES (10)"))
+        XCTAssertTrue(full.contains("MISSED DEADLINES (9)"))
     }
 
     func testFailuresOnlyFilenameIsDistinct() {
@@ -177,10 +189,33 @@ final class DetailAndExportTests: XCTestCase {
     }
 
     func testFailuresOnlyScope() {
-        let e = makeExport(sampleCount: 300).filteredToFailures()
+        let full = makeExport(sampleCount: 300)
+        let e = full.filteredToFailures()
         XCTAssertTrue(e.samples.allSatisfy { $0.routerMs == nil || $0.internetMs == nil })
-        XCTAssertEqual(e.samples.count, 10) // ids 0,30,60,...,270
-        XCTAssertEqual(e.summary.totalSamples, 10)
+        XCTAssertEqual(e.samples.count, 9) // ids 30,60,…,270; id 0 is warm-up
+    }
+
+    /// A filtered *view* of a session still has to describe the session. It
+    /// used to rebuild the summary from the failures alone, so a healthy run
+    /// with a handful of drops exported a block claiming 100% packet loss and
+    /// zero internet replies.
+    func testFailuresOnlySummaryStillDescribesTheWholeSession() {
+        let full = makeExport(sampleCount: 300)
+        let only = full.filteredToFailures()
+
+        XCTAssertEqual(only.summary, full.summary)
+        XCTAssertEqual(only.summary.totalSamples, 298) // 300 less the warm-up pair
+        XCTAssertGreaterThan(only.summary.internet.samples, 0)
+    }
+
+    /// The warm-up exclusion, applied here as it is on every screen: a session
+    /// the app calls clean must not export a failure and a spike.
+    func testExportSummaryExcludesTheWarmUpSamples() {
+        let e = makeExport(sampleCount: 300)
+        XCTAssertEqual(e.summary.totalSamples, 298)
+        XCTAssertEqual(e.samples.count, 300, "the raw rows keep everything")
+        XCTAssertEqual(e.failures.count, 9)
+        XCTAssertTrue(e.failures.allSatisfy { $0.id >= PingSample.warmupSampleCount })
     }
 
     func testLargeExportIsQuick() {

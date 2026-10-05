@@ -72,6 +72,141 @@ final class ChartSeriesTests: XCTestCase {
         XCTAssertEqual(runs[1].start, epoch.addingTimeInterval(1))
     }
 
+    // MARK: - Defect 3: a one-sample run has to have an extent
+
+    /// A single dropped ping is the smallest thing this app exists to catch,
+    /// and it used to be drawn as nothing at all: the run had `start == end`,
+    /// so its `RectangleMark(xStart:xEnd:)` was zero-width. The bucketer
+    /// deliberately does not break the trace for one lost ping inside a wide
+    /// bucket, so the band was the only report of it — and the band did not
+    /// draw.
+    func testASingleSampleOutageStillHasSomethingToDraw() {
+        var samples: [PingSample] = []
+        for id in 0..<10 { samples.append(sample(UInt32(id))) }
+        samples.append(sample(10, router: nil, internet: nil))
+        for id in 11..<20 { samples.append(sample(UInt32(id))) }
+
+        let series = PingChartSeries.build(samples: samples)
+        XCTAssertEqual(series.outages.map(\.value), [.both])
+        let run = series.outages[0]
+        XCTAssertEqual(run.sampleCount, 1)
+        XCTAssertEqual(run.start, epoch.addingTimeInterval(10))
+        XCTAssertEqual(run.end, run.start, "the measured span is still a single instant")
+        XCTAssertGreaterThan(run.drawnEnd, run.start,
+                             "a zero-width band draws nothing — this is the bug")
+        XCTAssertEqual(run.drawnEnd.timeIntervalSince(run.start), 1, accuracy: 0.0001,
+                       "one sample stands for exactly one tick of the stream")
+    }
+
+    /// Same defect on the other band. One sample of a throughput test is rare
+    /// but not impossible, and it disappeared for the same reason.
+    func testASingleSampleLoadRunStillHasSomethingToDraw() {
+        var samples: [PingSample] = []
+        for id in 0..<5 { samples.append(sample(UInt32(id))) }
+        samples.append(sample(5, phase: .downloading))
+        for id in 6..<12 { samples.append(sample(UInt32(id))) }
+
+        let series = PingChartSeries.build(samples: samples)
+        XCTAssertEqual(series.load.map(\.value), [.downloading])
+        let run = series.load[0]
+        XCTAssertEqual(run.sampleCount, 1)
+        XCTAssertEqual(run.end, run.start)
+        XCTAssertEqual(run.drawnEnd, run.start.addingTimeInterval(1))
+    }
+
+    /// The drawn extent is a floor, not an offset: it must never move the end
+    /// of a run that already spans more than one sample interval, or every
+    /// band would sit a tick to the right of the samples that produced it.
+    func testMultiSampleRunsAreDrawnExactlyWhereTheyWereMeasured() {
+        var encoder = RunEncoder<LoadPhase>()
+        for id in 3..<7 { encoder.append(.downloading, at: epoch.addingTimeInterval(Double(id))) }
+        encoder.append(nil, at: epoch.addingTimeInterval(7))
+        encoder.closeOpen()
+
+        let run = encoder.runs()[0]
+        XCTAssertEqual(run.sampleCount, 4)
+        XCTAssertEqual(run.end, epoch.addingTimeInterval(6))
+        XCTAssertEqual(run.drawnEnd, run.end, "a multi-sample run is drawn to its measured end")
+        XCTAssertEqual(run.duration, 3, accuracy: 0.0001)
+    }
+
+    /// The extent is one *observed* tick, not a hard-coded second: Core must
+    /// not have to be told what the user set the ping interval to.
+    func testTheDrawnExtentFollowsTheStreamsOwnCadence() {
+        var encoder = RunEncoder<OutageScope>()
+        // A 5 s cadence, with the lone outage in the middle.
+        encoder.append(nil, at: epoch)
+        encoder.append(nil, at: epoch.addingTimeInterval(5))
+        encoder.append(.internet, at: epoch.addingTimeInterval(10))
+        encoder.append(nil, at: epoch.addingTimeInterval(15))
+        encoder.closeOpen()
+
+        let run = encoder.runs()[0]
+        XCTAssertEqual(run.drawnEnd, epoch.addingTimeInterval(15),
+                       "one sample of a 5 s stream stands for 5 s, not 1 s")
+    }
+
+    /// A run that opens on the very first sample is created before any gap has
+    /// been seen, so it seals with the fallback cadence unless the encoder
+    /// re-stamps it on the way out.
+    func testAFirstSampleRunPicksUpTheCadenceItWasOpenedBefore() {
+        var encoder = RunEncoder<OutageScope>()
+        encoder.append(.both, at: epoch)
+        encoder.append(nil, at: epoch.addingTimeInterval(5))
+
+        let run = encoder.runs()[0]
+        XCTAssertEqual(run.drawnEnd, epoch.addingTimeInterval(5))
+    }
+
+    /// With nothing to learn from, the fallback is the app's default cadence —
+    /// still non-zero, because drawing nothing is the failure being fixed.
+    func testALoneSampleFallsBackToTheAssumedCadence() {
+        var encoder = RunEncoder<OutageScope>()
+        encoder.append(.router, at: epoch)
+        encoder.closeOpen()
+
+        let run = encoder.runs()[0]
+        XCTAssertEqual(run.drawnEnd.timeIntervalSince(run.start),
+                       RunEncoder<OutageScope>.assumedSampleInterval, accuracy: 0.0001)
+    }
+
+    /// A suspended Mac leaves an hours-long gap between two consecutive
+    /// samples. Taking the latest gap as the cadence would then stamp an
+    /// hours-wide band onto the next single dropped ping; the smallest gap is
+    /// the tick rate by definition.
+    func testASleepGapDoesNotInflateALaterSingleSampleRun() {
+        var encoder = RunEncoder<OutageScope>()
+        encoder.append(nil, at: epoch)
+        encoder.append(nil, at: epoch.addingTimeInterval(1))
+        // Sleep: four hours pass between two ticks.
+        encoder.append(nil, at: epoch.addingTimeInterval(14_401))
+        encoder.append(.internet, at: epoch.addingTimeInterval(14_402))
+        encoder.append(nil, at: epoch.addingTimeInterval(14_403))
+        encoder.closeOpen()
+
+        let run = encoder.runs()[0]
+        XCTAssertEqual(run.drawnEnd.timeIntervalSince(run.start), 1, accuracy: 0.0001)
+    }
+
+    /// The drawn extent must not leak into anything that reports a number.
+    /// `duration` is what was measured, and a one-sample run measured an
+    /// instant — the chart widens the rectangle, not the fact.
+    func testDurationStillReportsOnlyWhatWasMeasured() {
+        var encoder = RunEncoder<OutageScope>()
+        encoder.append(.both, at: epoch)
+        encoder.append(nil, at: epoch.addingTimeInterval(1))
+        encoder.append(.router, at: epoch.addingTimeInterval(2))
+        encoder.append(.router, at: epoch.addingTimeInterval(3))
+        encoder.append(.router, at: epoch.addingTimeInterval(4))
+        encoder.closeOpen()
+
+        let runs = encoder.runs()
+        XCTAssertEqual(runs[0].duration, 0, accuracy: 0.0001,
+                       "a single dropped ping did not last a second, it happened at an instant")
+        XCTAssertEqual(runs[1].duration, 2, accuracy: 0.0001)
+        XCTAssertEqual(runs[1].drawnEnd, runs[1].end)
+    }
+
     func testOutageScopeDistinguishesWhichHostIsSilent() {
         XCTAssertNil(OutageScope(routerSilent: false, internetSilent: false))
         XCTAssertEqual(OutageScope(routerSilent: true, internetSilent: false), .router)

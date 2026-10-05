@@ -181,9 +181,13 @@ public actor MonitorEngine {
         t.start()
     }
 
-    /// Wire sequence used only for the warm-up ping. `UInt16.max` truncated,
-    /// which a session would have to run for 18 hours at 1 Hz to reach — and by
-    /// then the prime is long resolved.
+    /// Wire sequence used only for the warm-up ping.
+    ///
+    /// `UInt16.max`, which is the top of the *internet* probe's space now that
+    /// `ProbeHost` splits the range, so the sample loop reaches it after 9.1
+    /// hours rather than 18. Still harmless: the prime resolves within its
+    /// timeout, seconds into the session, and `pending` is keyed by sequence
+    /// only for as long as a probe is in flight.
     private static let primeSequence: UInt32 = 0xFFFF
 
     private func runThroughputTest(
@@ -198,12 +202,31 @@ public actor MonitorEngine {
             currentPhase = .idle
         }
 
-        if cachedMeta == nil { cachedMeta = await throughput.fetchMeta() }
-
+        // The idle baseline is taken *before* the meta fetch, and the meta
+        // fetch is tagged as load.
+        //
+        // Both halves were wrong, and the second one produced a 591 ms spike on
+        // both hosts six seconds into a session — tagged `idle`, and therefore
+        // the session's maximum on both latency cards, on a link whose real
+        // worst reading was 31 ms. `fetchMeta()` is an HTTPS round trip to
+        // Cloudflare; on Wi-Fi it delays the ping loop exactly as the transfer
+        // does. It is our traffic, so it is our phase.
+        //
+        // And the baseline that follows it must not include it. Reading the
+        // window *after* the fetch meant the ten seconds it averaged over were
+        // the ten seconds the fetch had just disturbed — an idle baseline
+        // measured during activity, feeding the one subtraction the Speed card
+        // leads with.
         let now = Date()
         let idleFrom = now.addingTimeInterval(-(directionDuration.timeInterval + 2))
         let idleStats = latencyStats(phase: .idle, from: idleFrom, to: now)
         let idle = idleStats.mean
+
+        if cachedMeta == nil {
+            currentPhase = .downloading
+            cachedMeta = await throughput.fetchMeta()
+            currentPhase = .idle
+        }
 
         currentPhase = .downloading
         let dlStart = Date()
@@ -276,8 +299,15 @@ public actor MonitorEngine {
     /// far the spike went.
     private func latencyStats(phase: LoadPhase, from: Date, to: Date) -> PhaseLatency {
         var stats = RunningStats()
+        // The warm-up exclusion belongs here too. The first scheduled test
+        // fires about three seconds after pings begin, so without it the idle
+        // baseline of every session's first test is one or two samples that
+        // include the ~580 ms socket warm-up spike and the first internet
+        // timeout — a baseline wrong in both directions, feeding the one
+        // subtraction the Speed card leads with.
         for sample in recentSamples
-        where sample.phase == phase && sample.timestamp >= from && sample.timestamp <= to {
+        where sample.id >= PingSample.warmupSampleCount
+            && sample.phase == phase && sample.timestamp >= from && sample.timestamp <= to {
             if let ms = sample.internetMs { stats.add(ms) } else { stats.markGap() }
         }
         guard stats.count > 0 else { return PhaseLatency(jitter: stats.measuredJitter) }
@@ -318,21 +348,34 @@ public actor MonitorEngine {
 
         let router: Double?
         let internet: Double?
+        let routerLate: Double?
+        let internetLate: Double?
         if let pinger {
-            // Wire sequence `id + 1`, never 0. 1.1.1.1 does not answer an echo
-            // request with sequence 0 — measured: sequence 0 got no reply on
-            // any run, while 65535 and 1 upwards always did, and the local
-            // gateway answered 0 quite happily. So the very first internet
-            // sample of every session timed out, which is what
-            // `PingSample.warmupSampleCount` was quietly hiding.
-            async let r = pinger.ping(host: settings.routerHost, sequence: id &+ 1)
-            async let i = pinger.ping(host: settings.internetHost, sequence: id &+ 1)
+            // One sequence space per host, so the two probes cannot collide
+            // when both hosts are the same address — see `ProbeHost`. The
+            // `id + 1` offset predates that and still earns its keep: 1.1.1.1
+            // does not answer an echo request with sequence 0 (measured: 0 got
+            // no reply on any run, 65535 and 1 upwards always did), so without
+            // it the first internet sample of every session timed out, which
+            // is what `PingSample.warmupSampleCount` was quietly hiding.
+            async let r = pinger.ping(host: settings.routerHost,
+                                      sequence: ProbeHost.router.wireSequence(for: id &+ 1))
+            async let i = pinger.ping(host: settings.internetHost,
+                                      sequence: ProbeHost.internet.wireSequence(for: id &+ 1))
             let (ro, io) = await (r, i)
             router = ro.rttMs
             internet = io.rttMs
+            // A reply that missed the deadline resolves as `.lateReply`, so
+            // `rttMs` is nil above and the probe still reads as a timeout
+            // everywhere loss is counted. The RTT rides alongside instead of
+            // being discarded — see `PingOutcome`.
+            routerLate = ro.lateRttMs
+            internetLate = io.lateRttMs
         } else {
             router = nil
             internet = nil // no socket — still emit a sample so the stream keeps cadence
+            routerLate = nil
+            internetLate = nil
         }
 
         // The engine may have been stopped while these pings were in flight.
@@ -340,7 +383,9 @@ public actor MonitorEngine {
 
         let sample = PingSample(
             id: id, timestamp: scheduledAt,
-            routerMs: router, internetMs: internet, phase: currentPhase
+            routerMs: router, internetMs: internet,
+            routerLateMs: routerLate, internetLateMs: internetLate,
+            phase: currentPhase
         )
         holdback[id] = sample
 
@@ -349,7 +394,11 @@ public actor MonitorEngine {
 
         flushInOrder()
 
-        if router == nil, internet == nil {
+        // `noReply`, not `== nil`: the socket-rebuild heuristic is looking for
+        // a dead socket, and a host answering at 2.4 s is emphatically not one.
+        // Keying on the timely columns alone would have torn down and rebuilt a
+        // working socket in the middle of a bufferbloat episode.
+        if sample.routerNoReply, sample.internetNoReply {
             consecutiveTotalFailures += 1
             if consecutiveTotalFailures >= Self.failureRecoveryThreshold {
                 consecutiveTotalFailures = 0

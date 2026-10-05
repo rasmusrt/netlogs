@@ -2,7 +2,13 @@ import Foundation
 import Observation
 import NetlogsCore
 
-/// Every sample in which a host failed to reply, for the whole session.
+/// Every sample in which a host missed its deadline, for the whole session.
+///
+/// Missed the deadline, not "was lost". The rows include replies that arrived
+/// inside the grace window, and the sheet prints their round-trip time — see
+/// `PingSample.internetNoReply`. Keeping the late ones here is deliberate: they
+/// are the rows a user is looking for when a call broke up, and filtering them
+/// out would leave the sheet empty on exactly the sessions worth inspecting.
 ///
 /// This exists because the log table's Failures filter would otherwise be a
 /// trap. The live table is a five-minute window, so filtering *it* would show

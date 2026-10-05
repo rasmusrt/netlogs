@@ -22,6 +22,8 @@ final class MonitorController {
     let failures = FailureLog()
     let diagnostics = DiagnosticsModel()
     let throughput = ThroughputModel()
+    let traffic = TrafficLog()
+    let wan = WANTelemetryModel()
 
     private(set) var state: RunState = .idle
     private(set) var session: SessionState?
@@ -39,9 +41,18 @@ final class MonitorController {
     private var diagMonitor: DiagnosticsMonitor?
     private var pump: Task<Void, Never>?
     private var diagPump: Task<Void, Never>?
+    private var wanMonitor: WANTelemetryMonitor?
+    private var wanPump: Task<Void, Never>?
     private var throughputPump: Task<Void, Never>?
     private var manualTest: Task<Void, Never>?
     private var clock: Task<Void, Never>?
+    /// The in-flight `nettop` run, if any. One at a time: the trigger already
+    /// guarantees that, and holding the handle is what lets `stop()` cancel a
+    /// capture that would otherwise outlive its session by five seconds and
+    /// write a row against a session the user has finished with.
+    private var capture: Task<Void, Never>?
+    private var captureTrigger = TrafficCaptureTrigger()
+    private let sampleTraffic: any TrafficSampling
     /// Keeps the Mac awake for the duration of a session (plan §6.4).
     private var activity: (any NSObjectProtocol)?
 
@@ -49,10 +60,12 @@ final class MonitorController {
 
     init(
         store: SessionStore,
-        engineFactory: @escaping @MainActor (MonitorSettings) -> MonitorEngine = { MonitorEngine(settings: $0) }
+        engineFactory: @escaping @MainActor (MonitorSettings) -> MonitorEngine = { MonitorEngine(settings: $0) },
+        trafficSampler: any TrafficSampling = NetTopRunner()
     ) {
         self.store = store
         self.makeEngine = engineFactory
+        self.sampleTraffic = trafficSampler
     }
 
     /// The hosts the running session is actually probing.
@@ -91,6 +104,9 @@ final class MonitorController {
         failures.reset()
         diagnostics.reset()
         throughput.reset()
+        traffic.reset()
+        wan.reset()
+        captureTrigger = TrafficCaptureTrigger()
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.idleSystemSleepDisabled, .userInitiated],
             reason: "Netlogs monitoring session"
@@ -104,11 +120,18 @@ final class MonitorController {
         // Seal the trailing load/outage run so a session stopped mid-download
         // still renders that band.
         chart.finish()
+        // Stop clicked inside the first three seconds catches `run()` parked in
+        // the engine's socket warm-up. Without this cancel it woke up after the
+        // teardown and rebuilt the session this call had just dismantled.
+        pump?.cancel(); pump = nil
         clock?.cancel(); clock = nil
         diagMonitor?.stop(); diagMonitor = nil
         diagPump?.cancel(); diagPump = nil
+        stopWAN()
         throughputPump?.cancel(); throughputPump = nil
         manualTest?.cancel(); manualTest = nil
+        capture?.cancel(); capture = nil
+        traffic.captureFailed()
         let engine = engine
         let session = session
         Task { [store, weak self] in
@@ -163,9 +186,28 @@ final class MonitorController {
             }
 
             let stream = try await engine.start()
+            // Cancellation alone does not surface here: the engine's warm-up
+            // sleeps with `try?` and then hands back an already-finished
+            // stream, so a `stop()` that happened during those three seconds
+            // used to be invisible to this code. It resumed, set `.running`
+            // over the `.idle` stop had just written, and started a second
+            // DiagnosticsMonitor the completed `stop()` had no handle on — the
+            // toolbar showed a session that wasn't running, `start()` refused
+            // to run again because it guards on state, and the orphaned
+            // monitor kept polling CoreWLAN every 5 s until Stop was clicked a
+            // second time. Stopping the engine covers the opposite ordering,
+            // where `stop()` released its reference before this call got the
+            // actor and opened a socket nobody would ever close.
+            guard !Task.isCancelled, state == .starting else {
+                await engine.stop()
+                return
+            }
             state = .running
 
             startDiagnostics(settings: settings, sessionID: session.id)
+            if settings.wanTelemetryEnabled {
+                startWAN(settings: settings, sessionID: session.id)
+            }
 
             for await sample in stream {
                 // The first samples can carry the ICMP socket warm-up spike
@@ -183,12 +225,23 @@ final class MonitorController {
                 }
                 log.append(sample)
                 store.append(sample, to: session.id)
+
+                if settings.trafficCaptureEnabled,
+                   sample.id >= PingSample.warmupSampleCount {
+                    considerCapture(sample, sessionID: session.id)
+                }
             }
         } catch {
+            // Same race on the failure path: a socket that fails to open after
+            // the user has already stopped would otherwise replace their
+            // `.idle` with a red error banner, and nil out the engine and
+            // session of whatever run started in the meantime.
+            guard !Task.isCancelled else { return }
             endActivity()
             clock?.cancel(); clock = nil
             diagMonitor?.stop(); diagMonitor = nil
             diagPump?.cancel(); diagPump = nil
+            stopWAN()
             throughputPump?.cancel(); throughputPump = nil
             state = .error(Self.describe(error))
             if let session { try? store.stopSession(session.id) }
@@ -196,6 +249,40 @@ final class MonitorController {
             self.session = nil
         }
         pump = nil
+    }
+
+    /// Fire a `nettop` capture if this sample says a latency episode has begun.
+    ///
+    /// **Never awaited from the sample loop.** `nettop` takes about five
+    /// seconds; awaiting it here would stall the loop that drains the engine's
+    /// stream, which back-pressures the engine and puts a five-second hole in
+    /// the ping log the capture is supposed to explain. It is detached, and its
+    /// timestamp is the sample's, not the moment it finishes.
+    private func considerCapture(_ sample: PingSample, sessionID: UUID) {
+        guard capture == nil,
+              captureTrigger.shouldCapture(sample, now: sample.timestamp) else { return }
+        traffic.beginCapture()
+        capture = Task { [weak self, sampleTraffic, store] in
+            let processes = await sampleTraffic.sample(interval: 1)
+            guard let self, !Task.isCancelled else { return }
+            // `nil` is "could not sample"; `[]` is "sampled, nothing was
+            // sending" — and the second one is stored, because a quiet Mac
+            // during a latency episode is the finding that points at another
+            // device on the network.
+            guard let processes else {
+                self.traffic.captureFailed()
+                self.capture = nil
+                return
+            }
+            let capture = TrafficCapture(
+                timestamp: sample.timestamp,
+                routerMs: sample.routerRttMs, internetMs: sample.internetRttMs,
+                intervalSeconds: 1, processes: processes
+            )
+            self.traffic.append(capture)
+            try? store.appendTrafficCapture(capture, to: sessionID)
+            self.capture = nil
+        }
     }
 
     private func endActivity() {
@@ -221,6 +308,37 @@ final class MonitorController {
                 }
             }
         }
+    }
+
+    /// Poll the gateway beside the session, on its own monitor. The ping loop
+    /// never learns about it; a hung gateway costs gateway readings only.
+    ///
+    /// The key is read here, once per session, off the main actor — the
+    /// Keychain may ask the user first. No key is not an error: the monitor
+    /// runs and records `.noKey`, so the session says why it has no WAN data.
+    private func startWAN(settings: MonitorSettings, sessionID: UUID) {
+        wan.begin()
+        wanPump = Task { [weak self, store] in
+            let key = await Task.detached { GatewayKeychain.read() }.value
+            guard let self, !Task.isCancelled else { return }
+            let monitor = WANTelemetryMonitor(provider: UniFiGateway(
+                host: settings.effectiveWANGatewayHost,
+                apiKey: key,
+                pinnedSHA256: settings.wanCertificateSHA256
+            ))
+            self.wanMonitor = monitor
+            for await event in monitor.start() {
+                self.wan.apply(event.snapshot, stored: event.shouldStore)
+                if event.shouldStore {
+                    try? store.appendWANSnapshot(event.snapshot, to: sessionID)
+                }
+            }
+        }
+    }
+
+    private func stopWAN() {
+        wanMonitor?.stop(); wanMonitor = nil
+        wanPump?.cancel(); wanPump = nil
     }
 
     private static func describe(_ error: Error) -> String {

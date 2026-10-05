@@ -3,6 +3,7 @@ import NetlogsCore
 
 enum SidebarItem: Hashable {
     case monitor
+    case analysis
     case session(UUID)
 }
 
@@ -56,6 +57,7 @@ struct RootView: View {
             controller.onSessionStopped = { reload() }
             pruneIfNeeded()
             reload()
+            await backfillSummaries()
         }
         // `alert`, not `confirmationDialog`. Both look much the same on macOS,
         // but an alert is the canonical destructive confirmation here and it
@@ -100,7 +102,11 @@ struct RootView: View {
     @ViewBuilder
     private var detail: some View {
         let sessions = selectedSessions
-        if sessions.count > 1 {
+        if selection.contains(.analysis) {
+            AnalysisView(store: store, settings: settings) { id in
+                selection = [.session(id)]
+            }
+        } else if sessions.count > 1 {
             multiSelection(sessions)
         } else if let session = sessions.first {
             // A session row is written at start, so the running session appears
@@ -145,6 +151,22 @@ struct RootView: View {
 
     private func reload() {
         savedSessions = (try? store.allSessions()) ?? []
+    }
+
+    /// Fold any session that has no schema-6 summary — one recorded before the
+    /// migration, or force-quit before it reached `stopSession`.
+    ///
+    /// Off the main actor and after the first `reload`, so the sidebar is on
+    /// screen while it runs: over this database's 225,000 samples the whole
+    /// pass takes 262 ms, which is once, but it is not nothing. Reload again
+    /// only if it actually wrote something.
+    private func backfillSummaries() async {
+        let store = store
+        let running = controller.session?.id
+        let wrote = await Task.detached(priority: .utility) {
+            (try? store.backfillSummaries(excluding: running)) ?? 0
+        }.value
+        if wrote > 0 { reload() }
     }
 
     private func pruneIfNeeded() {

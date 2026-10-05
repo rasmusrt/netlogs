@@ -24,6 +24,23 @@ public struct MonitorSettings: Codable, Sendable, Hashable {
     /// Minutes between throughput tests: 5 | 10 | 15 | 30 | 60.
     public var throughputInterval: Int
     public var diagnosticsInterval: Duration
+    /// Capture what this Mac is sending when latency diverges
+    /// (``TrafficCaptureTrigger``). Defaults on: it is local, it is this
+    /// machine only, and it is the one thing that answers "what was uploading"
+    /// at the moment it matters rather than hours later. It records process
+    /// names, so it is a switch rather than an assumption.
+    public var trafficCaptureEnabled: Bool
+    /// Poll the gateway's controller for the WAN radio and counters (Phase 14).
+    /// Off by default: it needs an API key the user has to create, and it reads
+    /// a second device.
+    public var wanTelemetryEnabled: Bool
+    /// The controller to ask. `nil` means the session's router host, which is
+    /// the gateway in every setup this was built for.
+    public var wanGatewayHost: String?
+    /// SHA-256 of the one certificate the gateway is trusted to present. Not a
+    /// secret — it identifies the gateway, it does not unlock it — so it lives
+    /// here and not in the Keychain with the key.
+    public var wanCertificateSHA256: String?
 
     public init(
         routerHostAutomatic: Bool = true,
@@ -33,7 +50,11 @@ public struct MonitorSettings: Codable, Sendable, Hashable {
         pingTimeout: Duration = .seconds(2),
         throughputEnabled: Bool = true,
         throughputInterval: Int = 15,
-        diagnosticsInterval: Duration = .seconds(5)
+        diagnosticsInterval: Duration = .seconds(5),
+        trafficCaptureEnabled: Bool = true,
+        wanTelemetryEnabled: Bool = false,
+        wanGatewayHost: String? = nil,
+        wanCertificateSHA256: String? = nil
     ) {
         self.routerHostAutomatic = routerHostAutomatic
         self.routerHost = routerHost
@@ -43,6 +64,16 @@ public struct MonitorSettings: Codable, Sendable, Hashable {
         self.throughputEnabled = throughputEnabled
         self.throughputInterval = throughputInterval
         self.diagnosticsInterval = diagnosticsInterval
+        self.trafficCaptureEnabled = trafficCaptureEnabled
+        self.wanTelemetryEnabled = wanTelemetryEnabled
+        self.wanGatewayHost = wanGatewayHost
+        self.wanCertificateSHA256 = wanCertificateSHA256
+    }
+
+    /// The host the gateway poll goes to.
+    public var effectiveWANGatewayHost: String {
+        let typed = wanGatewayHost?.trimmingCharacters(in: .whitespaces) ?? ""
+        return typed.isEmpty ? routerHost : typed
     }
 
     /// Lenient decode so a persisted settings blob from an older build (missing
@@ -58,5 +89,9 @@ public struct MonitorSettings: Codable, Sendable, Hashable {
         throughputEnabled = try c.decodeIfPresent(Bool.self, forKey: .throughputEnabled) ?? d.throughputEnabled
         throughputInterval = try c.decodeIfPresent(Int.self, forKey: .throughputInterval) ?? d.throughputInterval
         diagnosticsInterval = try c.decodeIfPresent(Duration.self, forKey: .diagnosticsInterval) ?? d.diagnosticsInterval
+        trafficCaptureEnabled = try c.decodeIfPresent(Bool.self, forKey: .trafficCaptureEnabled) ?? d.trafficCaptureEnabled
+        wanTelemetryEnabled = try c.decodeIfPresent(Bool.self, forKey: .wanTelemetryEnabled) ?? d.wanTelemetryEnabled
+        wanGatewayHost = try c.decodeIfPresent(String.self, forKey: .wanGatewayHost) ?? d.wanGatewayHost
+        wanCertificateSHA256 = try c.decodeIfPresent(String.self, forKey: .wanCertificateSHA256) ?? d.wanCertificateSHA256
     }
 }

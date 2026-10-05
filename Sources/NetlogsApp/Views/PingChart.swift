@@ -31,7 +31,7 @@ struct PingChart: View {
             ForEach(series.load) { run in
                 RectangleMark(
                     xStart: .value("Load start", run.start),
-                    xEnd: .value("Load end", run.end)
+                    xEnd: .value("Load end", bandEnd(run.start, run.drawnEnd))
                 )
                 .foregroundStyle(
                     Palette.Chart.load(run.value).opacity(Palette.Chart.bandOpacity)
@@ -41,7 +41,7 @@ struct PingChart: View {
             ForEach(series.outages) { run in
                 RectangleMark(
                     xStart: .value("Outage start", run.start),
-                    xEnd: .value("Outage end", run.end)
+                    xEnd: .value("Outage end", bandEnd(run.start, run.drawnEnd))
                 )
                 // Kept light on purpose. At full saturation a two-minute
                 // outage became a solid block that read as the subject of the
@@ -126,6 +126,35 @@ struct PingChart: View {
         .overlay(alignment: .topLeading) { clippedNotice }
         .accessibilityLabel("Round-trip time over time")
         .accessibilityValue(accessibilitySummary)
+    }
+
+    /// The visible floor on a band's width, in chart-x units.
+    ///
+    /// `Run.drawnEnd` already guarantees a band is at least the one sample
+    /// interval it stands for, which is what stops a single dropped ping being
+    /// a zero-width rectangle that draws nothing. That is enough at 5m range
+    /// and on a short session; it is not enough at session range on a long one,
+    /// where one second of an eight-hour domain is about a hundredth of a point
+    /// and the band is still invisible — the very hour-scale case
+    /// `PingChartBucketer` promises the band will cover, since it leaves the
+    /// trace unbroken for a single lost ping.
+    ///
+    /// Sized against the x-domain rather than the plot's pixel width on
+    /// purpose: reading the latter needs a chart proxy and a layout pass on
+    /// every publish, and this only has to clear a couple of points. At a
+    /// typical ~800 pt plot this lands around 3 pt.
+    ///
+    /// This does draw a one-sample outage wider than it lasted. That is a
+    /// deliberate and local exception, and it stays inside the drawing: the
+    /// band is an annotation on the trace, not a measurement of it, and every
+    /// number the app reports — `Run.duration`, `sampleCount`, the summary
+    /// cards, the export — still comes from the measured `start` and `end`.
+    private var minimumBandSpan: TimeInterval {
+        series.xDomain.upperBound.timeIntervalSince(series.xDomain.lowerBound) / 240
+    }
+
+    private func bandEnd(_ start: Date, _ drawnEnd: Date) -> Date {
+        max(drawnEnd, start.addingTimeInterval(minimumBandSpan))
     }
 
     /// A clamped peak has to say so. Without this the trace simply rides the

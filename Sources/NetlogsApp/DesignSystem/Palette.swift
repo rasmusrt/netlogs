@@ -76,33 +76,75 @@ enum Palette {
         }
     }
 
-    /// Latency thresholds for the log table, in milliseconds.
+    /// `nil` means "normal — leave it the default colour". Used where a tint is
+    /// an exception rather than a rule, such as a summary card's max.
     ///
-    /// Deliberately generous, and deliberately returning `nil` below the first
-    /// one. Tinting every row would make the table a wall of colour and hide
-    /// the outliers it exists to reveal; only values worth a second look get
-    /// painted. These are host-agnostic — a router at 80 ms and an internet
-    /// host at 80 ms are both worth noticing.
-    enum Latency {
-        static let elevated: Double = 80
-        static let high: Double = 200
-        static let severe: Double = 500
+    /// The thresholds live in `LatencyGrade` now, in Core, so the score and the
+    /// tint read one ramp. Tinting every row would make the table a wall of
+    /// colour and hide the outliers it exists to reveal — over the real
+    /// database 95% of replies fall below the first step *on both ramps*,
+    /// which is what keeps this honest.
+    ///
+    /// `on:` says which leg the figure describes; there is no default, because
+    /// grading a gateway reply on the internet ramp is the bug this replaced.
+    static func latency(_ milliseconds: Double, on ramp: LatencyGrade.Ramp) -> Color? {
+        grade(LatencyGrade(milliseconds: milliseconds, on: ramp))
+    }
+
+    static func grade(_ grade: LatencyGrade) -> Color? {
+        switch grade {
+        case .fine:     return nil
+        case .elevated: return warn
+        case .high:     return bad
+        case .severe:   return critical
+        }
     }
 
     /// A colour for every latency, for the log table's pills — where "this one
     /// is fine" is worth saying out loud rather than leaving blank.
-    static func pill(_ milliseconds: Double) -> Color {
-        latency(milliseconds) ?? good
+    static func pill(_ milliseconds: Double, on ramp: LatencyGrade.Ramp) -> Color {
+        latency(milliseconds, on: ramp) ?? good
     }
 
-    /// `nil` means "normal — leave it the default colour". Used where a tint is
-    /// an exception rather than a rule, such as a summary card's max.
-    static func latency(_ milliseconds: Double) -> Color? {
-        switch milliseconds {
-        case ..<Latency.elevated: return nil
-        case ..<Latency.high:     return warn
-        case ..<Latency.severe:   return bad
-        default:                  return critical
+    /// Jitter, on the ramp anchored to the rule the verdict already uses.
+    ///
+    /// It was tinted with ``latency(_:)``, whose first step was 80 ms, while
+    /// `SessionVerdict` calls a session "Unstable latency" at 30. A 50 ms
+    /// jitter drove an amber verdict in the header while the number itself
+    /// rendered plain white two inches below it.
+    static func jitter(_ milliseconds: Double) -> Color? {
+        switch JitterGrade(milliseconds: milliseconds) {
+        case .fine:     return nil
+        case .elevated: return warn
+        case .high:     return bad
+        case .severe:   return critical
+        }
+    }
+
+    /// A score's colour is its limiting component's own grade colour, not a
+    /// second number→colour ramp. So the score is by construction the same
+    /// colour as the card for the thing limiting it, and `nil` — inherit the
+    /// default — when nothing is.
+    static func score(_ score: NetworkScore) -> Color? {
+        guard let constraint = score.constraint else { return nil }
+        // From the component's own measurement, not from its score: the score
+        // is a reparameterisation, and colouring from the number it came out of
+        // rather than the number it went in with would put a rounding step
+        // between the tint and the figure beside it.
+        switch constraint.kind {
+        case .loss:        return loss(constraint.measurement)
+        case .latency:     return latency(constraint.measurement, on: .internet)
+        case .jitter:      return jitter(constraint.measurement)
+        case .bufferbloat: return bufferbloat(constraint.measurement)
+        }
+    }
+
+    /// Loss, on the verdict's own thresholds.
+    static func loss(_ ratio: Double) -> Color? {
+        switch LossGrade(ratio: ratio) {
+        case .none:   return nil
+        case .lossy:  return bad
+        case .severe: return critical
         }
     }
 

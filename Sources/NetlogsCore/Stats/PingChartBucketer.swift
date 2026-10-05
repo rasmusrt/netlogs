@@ -135,11 +135,24 @@ public struct PingChartBucketer: Sendable {
         var router = HostFold()
         var internet = HostFold()
 
+        /// Folds the *observed* round trip, late replies included.
+        ///
+        /// `routerRttMs`, not `routerMs`. The trace is a picture of what the
+        /// link did, and a reply that came back at 2.4 s did something — it
+        /// belongs on the chart as a spike, which is what it is. Dropping it
+        /// drew a hole instead, so a bufferbloat episode that ramped 700 ms →
+        /// 1.8 s → over the deadline → 1.5 s rendered as a ramp, a gap, and a
+        /// ramp back down: the peak, the one part worth seeing, was the part
+        /// that went missing.
+        ///
+        /// This is why `LatencyCard` shows `LateReplies.worst` rather than
+        /// `PingStat.max` — the card and the trace have to agree about how high
+        /// the spike went, and `PingStat.max` cannot exceed the ping timeout.
         mutating func add(_ sample: PingSample) {
             samples += 1
             lastTime = sample.timestamp
-            if let ms = sample.routerMs { router.add(ms) }
-            if let ms = sample.internetMs { internet.add(ms) }
+            if let ms = sample.routerRttMs { router.add(ms) }
+            if let ms = sample.internetRttMs { internet.add(ms) }
         }
 
         mutating func merge(_ other: Bucket) {
@@ -309,9 +322,13 @@ extension PingChartSeries {
         for sample in samples where sample.id >= warmupSamplesToSkip {
             bucketer.append(sample)
             load.append(sample.phase == .idle ? nil : sample.phase, at: sample.timestamp)
+            // The band means "nothing came back", so it keys on silence, not
+            // on the deadline. A shaded outage over a stretch where every ping
+            // was answered — slowly — is the same overstatement the failure
+            // count used to make, drawn in red across the trace.
             outages.append(
-                OutageScope(routerSilent: sample.routerMs == nil,
-                            internetSilent: sample.internetMs == nil),
+                OutageScope(routerSilent: sample.routerNoReply,
+                            internetSilent: sample.internetNoReply),
                 at: sample.timestamp
             )
         }
