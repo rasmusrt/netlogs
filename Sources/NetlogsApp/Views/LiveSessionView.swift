@@ -13,6 +13,9 @@ struct LiveSessionView: View {
     var onSessionEnd: () -> Void = {}
 
     @Binding var mode: DetailMode
+    /// The Monitor v2 beta flag. Same controller, same sheets, same toolbar;
+    /// only the body below the header differs.
+    var usesV2 = false
     @State private var sheet: SessionSheet?
     @State private var loader = LiveSheetLoader()
 
@@ -23,7 +26,7 @@ struct LiveSessionView: View {
 
     var body: some View {
         Group {
-            if isIdle { idleState } else { session }
+            if isIdle { idleState } else if usesV2 { sessionV2 } else { session }
         }
         .navigationTitle("Monitor")
         .toolbar { toolbarContent }
@@ -70,27 +73,39 @@ struct LiveSessionView: View {
         }
     }
 
+    private var sessionV2: some View {
+        MonitorV2View(controller: controller, isCovered: sheet != nil,
+                      onSelect: { sheet = $0 }) {
+            header
+        }
+        .animation(.default, value: controller.state)
+    }
+
+    private var header: some View {
+        VStack(spacing: Space.s) {
+            SessionVerdictHeader(
+                verdict: verdict,
+                reason: SessionVerdict.reason(for: verdict,
+                                              summary: controller.stats.summary,
+                                              throughput: controller.throughput.averages),
+                elapsed: controller.stats.elapsed,
+                sampleCount: controller.stats.sampleCount,
+                failureCount: controller.stats.failureCount,
+                lostCount: controller.stats.summary.noReplyCount,
+                lateCount: controller.stats.summary.lateCount,
+                underLoadCount: controller.stats.summary.failuresUnderLoad,
+                status: statusChip,
+                onShowFailures: { sheet = .failures }
+            )
+            if case .error(let message) = controller.state {
+                ErrorBanner(message: message) { controller.start(settings: settings) }
+            }
+        }
+    }
+
     private var session: some View {
         SessionScaffold(mode: mode) {
-            VStack(spacing: Space.s) {
-                SessionVerdictHeader(
-                    verdict: verdict,
-                    reason: SessionVerdict.reason(for: verdict,
-                                                  summary: controller.stats.summary,
-                                                  throughput: controller.throughput.averages),
-                    elapsed: controller.stats.elapsed,
-                    sampleCount: controller.stats.sampleCount,
-                    failureCount: controller.stats.failureCount,
-                    lostCount: controller.stats.summary.noReplyCount,
-                    lateCount: controller.stats.summary.lateCount,
-                    underLoadCount: controller.stats.summary.failuresUnderLoad,
-                    status: statusChip,
-                    onShowFailures: { sheet = .failures }
-                )
-                if case .error(let message) = controller.state {
-                    ErrorBanner(message: message) { controller.start(settings: settings) }
-                }
-            }
+            header
         } content: {
             SummaryCards(
                 latency: controller.stats.summary,
@@ -148,7 +163,7 @@ struct LiveSessionView: View {
     private var statusChip: SessionVerdictHeader.StatusChip? {
         switch controller.state {
         case .idle:     return .init(text: "Idle", color: .secondary)
-        case .starting: return .init(text: "Starting…", color: Palette.warn)
+        case .starting: return .init(text: "Starting…", color: .secondary)
         // No chip while running: the sidebar's Monitor row carries the live
         // badge now, and it stays visible while you read a different log.
         // `starting` and `error` keep theirs — they are transient states you
@@ -189,17 +204,30 @@ struct LiveSessionView: View {
                     .contentTransition(.symbolEffect(.replace))
             }
             .labelStyle(.titleAndIcon)
-            // Green to begin, red to end — the one control in the app whose
-            // two states do opposite things, so it should not look identical
-            // in both.
-            .buttonStyle(.borderedProminent)
-            .tint(controller.isRunning ? Palette.critical : Palette.good)
+            // Prominent to begin, plain to end. The two states still look
+            // different — the one control here whose states do opposite
+            // things — but without a traffic light in the toolbar: green and
+            // red up there were the loudest colours on screen while saying
+            // nothing about the connection.
+            .modifier(StartStopStyle(isRunning: controller.isRunning))
             .animation(.smooth(duration: 0.25), value: controller.isRunning)
             .keyboardShortcut(controller.isRunning ? "." : "r", modifiers: .command)
         }
     }
 
 
+}
+
+private struct StartStopStyle: ViewModifier {
+    let isRunning: Bool
+
+    func body(content: Content) -> some View {
+        if isRunning {
+            content.buttonStyle(.bordered)
+        } else {
+            content.buttonStyle(.borderedProminent)
+        }
+    }
 }
 
 /// Summary / Chart switch. Icon-only so it survives a narrow toolbar.

@@ -88,4 +88,8 @@ public struct PingSample: Codable, Identifiable, Sendable, Hashable {
     /// stored-session path can't disagree about it — which they did before
     /// Phase 9, leaving saved charts scaled to the spike.
     public static let warmupSampleCount: UInt32 = 2
+
+    /// `true` for a warm-up sample. The one spelling of the exclusion; the
+    /// filter sites used to each write `id >= warmupSampleCount` themselves.
+    public var isWarmup: Bool { id < Self.warmupSampleCount }
 }

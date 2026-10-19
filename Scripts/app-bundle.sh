@@ -32,6 +32,7 @@ BIN="$("${BUILD[@]}" --show-bin-path 2>/dev/null)/NetlogsApp"
 # app replaces is also called "Netlogs" (/Applications/Glaze/Netlogs.app), so
 # `pkill -x Netlogs` quits that too — which it did, repeatedly, before anyone
 # noticed.
+pkill -f "$HOME/Applications/Netlogs Beta.app/Contents/MacOS/Netlogs" 2>/dev/null || true
 pkill -f "$HOME/Applications/Netlogs.app/Contents/MacOS/Netlogs" 2>/dev/null || true
 pkill -f "$PWD/build/Netlogs.app/Contents/MacOS/Netlogs" 2>/dev/null || true
 pkill -x NetlogsApp 2>/dev/null || true
@@ -47,29 +48,29 @@ cp build/AppIcon.icns "$STAGE/Contents/Resources/AppIcon.icns"
 printf 'APPL????' > "$STAGE/Contents/PkgInfo"
 echo "built $STAGE"
 
-# A stable identity, so the app keeps one identity across rebuilds and the
-# Keychain remembers "Always Allow" for the gateway key: the Developer ID when
-# this Mac has one, else "Netlogs Development" (Scripts/make-dev-identity.sh,
-# the stopgap from before the Developer Program). Ad-hoc otherwise: that works,
-# but asks again after every build. Release signing is Scripts/release.sh.
+# The Developer ID when this Mac has one, so the app keeps one identity across
+# rebuilds and the Keychain remembers "Always Allow" for the gateway key.
+# Ad-hoc otherwise (a fresh clone on someone else's Mac): that works, but asks
+# again after every build. Release signing is Scripts/release.sh.
 SIGN=-
-# -v (valid only) for the Developer ID; not for the self-signed one, which
-# macOS lists but never counts as valid.
 DEVID="$(security find-identity -v -p codesigning 2>/dev/null \
     | sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -1)"
-if [ -n "$DEVID" ]; then
-    SIGN="$DEVID"
-elif security find-identity -p codesigning 2>/dev/null | grep -q '"Netlogs Development"'; then
-    SIGN="Netlogs Development"
-fi
+[ -n "$DEVID" ] && SIGN="$DEVID"
 
 [ "${1:-}" = "--build-only" ] && { codesign --force --sign "$SIGN" --timestamp=none --entitlements Support/Netlogs.entitlements "$STAGE"; exit 0; }
 
-DEST="$HOME/Applications/Netlogs.app"
+# "Netlogs Beta", so a local build is never mistaken for the released app in
+# /Applications (Homebrew). Same bundle identifier, so both read the same
+# sessions and settings; only the name in Finder, Spotlight and the menu bar
+# differs. Builds from before the rename went to ~/Applications/Netlogs.app.
+DEST="$HOME/Applications/Netlogs Beta.app"
 mkdir -p "$HOME/Applications"
-rm -rf "$DEST"
+rm -rf "$DEST" "$HOME/Applications/Netlogs.app"
 cp -R "$STAGE" "$DEST"
 xattr -cr "$DEST"   # strip iCloud provenance / any quarantine
+for key in CFBundleName CFBundleDisplayName; do
+    /usr/libexec/PlistBuddy -c "Set :$key Netlogs Beta" "$DEST/Contents/Info.plist"
+done
 # Signed at the final location (no --deep / no hardened runtime — they only
 # add Gatekeeper friction for a local dev build).
 codesign --force --sign "$SIGN" --timestamp=none --entitlements Support/Netlogs.entitlements "$DEST"

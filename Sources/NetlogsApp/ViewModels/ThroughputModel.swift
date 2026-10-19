@@ -18,7 +18,13 @@ final class ThroughputModel {
         results.append(result)
     }
 
+    /// Guarded, because the controller's clock calls this once a second with
+    /// whatever the engine reports — which is `.idle` for all but the ~25 s of
+    /// a test. An unconditional write is an Observation change notification
+    /// every tick, and `phase` / `isTesting` are read by the summary cards, so
+    /// the cards were being asked to re-render for a value that had not moved.
     func setPhase(_ phase: LoadPhase) {
+        guard phase != self.phase else { return }
         self.phase = phase
     }
 

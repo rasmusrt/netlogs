@@ -12,21 +12,18 @@ struct SavedSessionView: View {
     @State private var detail: SessionDetail?
     @State private var failedToLoad = false
 
-    var body: some View {
-        Group {
-            if let detail {
-                loaded(detail)
-            } else if failedToLoad {
-                ContentUnavailableView(
-                    "Couldn't load this session",
-                    systemImage: "exclamationmark.triangle",
-                    description: Text("The session may have been deleted.")
-                )
-            } else {
-                ProgressView().controlSize(.small)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
+    private var state: LoadState<SessionDetail> {
+        if let detail { return .loaded(detail) }
+        if failedToLoad {
+            return .unavailable(EmptyState("Couldn't load this session",
+                                           systemImage: "exclamationmark.triangle",
+                                           message: "The session may have been deleted."))
         }
+        return .loading
+    }
+
+    var body: some View {
+        LoadStateView(state) { loaded($0) }
         .navigationTitle(session.startedAt.formatted(date: .abbreviated, time: .shortened))
         .navigationSubtitle(Fmt.duration(session.duration))
         .toolbar { toolbarContent }

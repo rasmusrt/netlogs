@@ -57,35 +57,41 @@ struct SessionScaffold<Header: View, Body_: View, Log: View>: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    /// The log's title row plus a few rows: below this the summary scrolls
+    /// rather than the log disappearing.
+    private static var logMinHeight: CGFloat { 140 }
+
     var body: some View {
         switch mode {
         case .summary:
-            // No scroll view, no measuring. `summaryStack` is a plain stack of
-            // fixed-height cards, so it reports its own natural height; the
-            // log is a greedy `Table` and takes everything left over, down to
-            // the window's bottom edge.
+            // The summary takes its natural height and the log takes the
+            // rest, down to the window's bottom edge — until the window is too
+            // short for both. Then the summary scrolls instead of growing.
             //
-            // Every version that put the summary in a `ScrollView` failed,
-            // because on this SwiftUI a `ScrollView` will not adopt its
-            // content's height — not with a `maxHeight` (it fell back to the
-            // cap and left a slab of slack), not with `ViewThatFits` + a
-            // layout priority (it took the whole column and centred the cards
-            // in it), not with `.fixedSize(vertical:)` (same centring), and
-            // not with an off-screen `.background` measurement feeding
-            // `.frame(height:)` (the measurement is derived from the layout it
-            // feeds, so the loop settled differently per session and the log
-            // stopped short for every log but the shortest).
+            // This was a plain `VStack` with `.layoutPriority(1)` on the
+            // summary, which cannot give height back: a saved session with all
+            // five cards needs more than a 530 pt window has, so the detail
+            // column's *minimum* height exceeded the window. `NavigationSplitView`
+            // then overflowed and was centred in the window, which moved both
+            // columns about 22 pt up under the toolbar — the sidebar's first
+            // row under the traffic lights and the verdict header against the
+            // navigation title. Shorter sessions fit, which is why it only
+            // showed on some logs.
             //
-            // `.layoutPriority(1)` makes the stack hand the summary its full
-            // natural height first; the log gets the rest. No `maxHeight` on
-            // the summary — it reads as "fill up to this" and left a tall band
-            // of empty space under the cards on a tall window.
-            VStack(spacing: 0) {
-                summaryStack
-                    .layoutPriority(1)
+            // A `ScrollView` will not adopt its content's height on its own —
+            // not with a `maxHeight`, `ViewThatFits`, `.fixedSize` or a
+            // measuring `.background`, all tried before — so the height is
+            // decided by `SummaryOverLog`, which measures the stack through an
+            // unconstrained proposal and hands the scroll view an exact size.
+            SummaryOverLog(logMinHeight: Self.logMinHeight) {
+                ScrollView { summaryStack }
+                    .scrollBounceBehavior(.basedOnSize)
+                    .fadingTopScrollEdge()
 
-                SectionSeparator()
-                log
+                VStack(spacing: 0) {
+                    SectionSeparator()
+                    log
+                }
             }
 
         case .chart:
@@ -103,48 +109,29 @@ struct SessionScaffold<Header: View, Body_: View, Log: View>: View {
     }
 }
 
-/// The rule between the summary and the log.
+/// The summary over the log: the summary gets its natural height, capped so
+/// that the log keeps at least `logMinHeight`; the log gets the rest.
 ///
-/// A plain `Divider()` uses the full-strength separator colour, which reads as
-/// a hard line in dark mode where it sits against a near-black background —
-/// far more prominent than the same divider looks in light. This is the same
-/// colour at a weight that matches in both appearances.
-struct SectionSeparator: View {
-    var body: some View {
-        Rectangle()
-            .fill(.separator)
-            .opacity(0.5)
-            .frame(height: 1)
+/// Always reports exactly the size it is offered, so the detail column's
+/// minimum height never depends on how many cards a session has.
+private struct SummaryOverLog: Layout {
+    let logMinHeight: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        proposal.replacingUnspecifiedDimensions()
     }
-}
 
-/// Full-bleed banner for a session-level error.
-struct ErrorBanner: View {
-    let message: String
-    var onRetry: () -> Void
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: Space.m) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(Palette.critical)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Monitoring stopped").font(.callout.weight(.medium))
-                Text(message)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            }
-            Spacer(minLength: Space.m)
-            Button("Retry", action: onRetry)
-                .controlSize(.small)
-        }
-        .padding(Space.m)
-        .background(Palette.fill(Palette.critical),
-                    in: RoundedRectangle(cornerRadius: Radius.card, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: Radius.card, style: .continuous)
-                .strokeBorder(Palette.critical.opacity(0.3), lineWidth: 1)
-        }
-        .transition(.move(edge: .top).combined(with: .opacity))
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize,
+                       subviews: Subviews, cache: inout ()) {
+        guard subviews.count == 2 else { return }
+        let natural = subviews[0]
+            .sizeThatFits(ProposedViewSize(width: bounds.width, height: nil)).height
+        let summary = max(0, min(natural, bounds.height - logMinHeight))
+        subviews[0].place(at: bounds.origin, anchor: .topLeading,
+                          proposal: ProposedViewSize(width: bounds.width, height: summary))
+        subviews[1].place(at: CGPoint(x: bounds.minX, y: bounds.minY + summary),
+                          anchor: .topLeading,
+                          proposal: ProposedViewSize(width: bounds.width,
+                                                     height: bounds.height - summary))
     }
 }

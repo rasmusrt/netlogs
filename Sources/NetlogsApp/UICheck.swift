@@ -138,7 +138,7 @@ enum UICheck {
            let stored = try? controller.store.samples(for: session.id) {
             // Mirrors DetailLoader: analysis skips the ICMP warm-up samples,
             // the export keeps everything.
-            let samples = stored.filter { $0.id >= PingSample.warmupSampleCount }
+            let samples = stored.filter { !$0.isWarmup }
             let d = DetailSummary.build(samples: samples,
                                        throughput: (try? controller.store.throughputResults(for: session.id)) ?? [],
                                        diagnostics: (try? controller.store.diagnostics(for: session.id)) ?? [])

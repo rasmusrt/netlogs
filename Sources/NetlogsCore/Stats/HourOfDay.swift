@@ -25,6 +25,37 @@ public struct HourlyBucket: Sendable, Equatable {
     }
 }
 
+/// One session's loss and jitter in one hour of one calendar day — the
+/// per-hour counterpart of ``PingAggregate`` for the Analysis chart.
+public struct HourlyPingStats: Sendable, Equatable {
+    public let key: HourKey
+    /// Idle samples taken in the hour.
+    public let samples: Int
+    /// Samples where the router sent nothing back, not even late — the same
+    /// count ``SessionAnalysis/routerLossRatio`` divides.
+    public let routerLost: Int
+    /// Samples where the internet missed its deadline while the router
+    /// answered — ``SessionAnalysis/internetOnlyTimeouts``, per hour.
+    public let internetOnlyLost: Int
+    /// Σ|Δ| between consecutive internet replies, and how many pairs.
+    public let jitterSum: Double
+    public let jitterPairs: Int
+
+    public init(key: HourKey, samples: Int, routerLost: Int, internetOnlyLost: Int,
+                jitterSum: Double, jitterPairs: Int) {
+        self.key = key
+        self.samples = samples
+        self.routerLost = routerLost
+        self.internetOnlyLost = internetOnlyLost
+        self.jitterSum = jitterSum
+        self.jitterPairs = jitterPairs
+    }
+
+    public var measuredJitter: Double? {
+        jitterPairs > 0 ? jitterSum / Double(jitterPairs) : nil
+    }
+}
+
 /// What one hour of the day looked like across a range.
 public struct HourProfile: Sendable, Equatable, Identifiable {
     public let hour: Int
@@ -74,8 +105,20 @@ public struct HourOfDayProfile: Sendable, Equatable {
         }
     }
 
+    /// Twenty-four empty hours and no median, shared.
+    ///
+    /// `build` is called for every target group — and a rule that regroups
+    /// sessions to count their days builds groups with no buckets at all. Each
+    /// empty profile would otherwise allocate 25 histograms of 1,001 integers
+    /// (about 200 KB) to say nothing; this one is made once and handed out.
+    public static let empty = HourOfDayProfile(
+        hours: (0..<24).map { HourProfile(hour: $0, histogram: LatencyHistogram(), days: 0) },
+        overallMedian: nil
+    )
+
     public static func build(_ buckets: [HourlyBucket], sessionIDs: Set<UUID>) -> HourOfDayProfile {
         let mine = buckets.filter { sessionIDs.contains($0.key.sessionID) }
+        guard !mine.isEmpty else { return .empty }
         var byHour: [Int: [HourlyBucket]] = [:]
         for bucket in mine { byHour[bucket.key.hour, default: []].append(bucket) }
 

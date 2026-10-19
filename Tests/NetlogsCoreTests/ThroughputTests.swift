@@ -18,6 +18,26 @@ private final class RampPinger: ICMPPinging, @unchecked Sendable {
     func ping(host: String, sequence: UInt32) async -> PingOutcome { .reply(rttMs: rtt(sequence)) }
 }
 
+/// Router answers instantly; the internet host answers as the script says,
+/// optionally after a delay, so a reply can land after the phase that sent it
+/// has ended.
+private final class ScriptedPinger: ICMPPinging, @unchecked Sendable {
+    typealias Script = @Sendable (UInt32) -> (delay: Duration, outcome: PingOutcome)
+    let internet: Script
+    init(internet: @escaping Script) { self.internet = internet }
+    convenience init(instantInternet: @escaping @Sendable (UInt32) -> PingOutcome) {
+        self.init(internet: { (delay: Duration.zero, outcome: instantInternet($0)) })
+    }
+    func open() throws {}
+    func close() {}
+    func ping(host: String, sequence: UInt32) async -> PingOutcome {
+        guard host == "i" else { return .reply(rttMs: 2) }
+        let step = internet(sequence)
+        if step.delay > .zero { try? await Task.sleep(for: step.delay) }
+        return step.outcome
+    }
+}
+
 private struct FakeThroughput: ThroughputProvider {
     func measureDownload(duration: Duration, discardingFirst warmup: Duration) async -> ThroughputMeasurement {
         try? await Task.sleep(for: duration)
@@ -190,6 +210,101 @@ final class ThroughputTests: XCTestCase {
                              "load window caught the ~220 ms pings")
         XCTAssertGreaterThan(try XCTUnwrap(result.bufferbloatMs), 80,
                              "load latency well above idle")
+    }
+
+    /// The engine wrote `idle ?? 0` and `load ?? idle ?? 0` into a result
+    /// whose fields are optional for a reason. Schema 5 nulled those zeros on
+    /// disk, but the engine kept producing them: an idle window with no
+    /// replies made a 0 ms baseline and the whole load latency read as
+    /// bufferbloat; a load window with no replies borrowed the idle figure
+    /// and a link that stopped answering under load graded "excellent".
+    func testEngineReportsUnmeasuredWindowsAsNilNotZero() async throws {
+        let pinger = ScriptedPinger(instantInternet: { _ in .timeout }) // router fine, internet silent
+        let engine = MonitorEngine(
+            settings: MonitorSettings(
+                routerHost: "r", internetHost: "i",
+                pingInterval: .milliseconds(50), pingTimeout: .seconds(1),
+                throughputEnabled: false
+            ),
+            pingerFactory: { _, _ in pinger },
+            throughputProvider: FakeThroughput()
+        )
+        let results = Box<ThroughputResult>()
+        let resultStream = await engine.throughputResults()
+        let sampleStream = try await engine.start(warmup: .zero)
+        let sc = Task { for await _ in sampleStream {} }
+        let rc = Task { for await r in resultStream { results.append(r) } }
+
+        try await Task.sleep(for: .milliseconds(300))
+        await engine.runThroughputTestNow(
+            directionDuration: .milliseconds(200),
+            settle: .milliseconds(50),
+            warmup: .milliseconds(20)
+        )
+        await engine.stop()
+        _ = await sc.value
+        _ = await rc.value
+
+        let result = try XCTUnwrap(results.all.first)
+        XCTAssertNil(result.idleLatencyMs, "no reply in the idle window is not a 0 ms baseline")
+        XCTAssertNil(result.downloadLatencyMs, "no reply under load is not the idle figure")
+        XCTAssertNil(result.uploadLatencyMs)
+        XCTAssertNil(result.bufferbloatMs, "nothing measured, nothing derived")
+        XCTAssertEqual(try XCTUnwrap(result.packetLoss), 1, accuracy: 1e-9,
+                       "the loss figure is the one thing this window did measure")
+    }
+
+    /// Two defects with one cause. A sample was tagged with the phase at the
+    /// moment its reply *arrived*, and the result was computed the moment the
+    /// upload *stopped*. The replies still in flight at that moment are the
+    /// slow ones, so the slowest loaded probes were either tagged with the
+    /// wrong phase or not counted at all, and "latency under load" averaged
+    /// the quick replies.
+    ///
+    /// Here every probe sent after the idle lead-in takes 300 ms, against a
+    /// 300 ms direction window: not one loaded reply has landed when its
+    /// direction ends. Both load figures must still come out at 300.
+    func testSlowLoadedRepliesCountTowardsTheirPhase() async throws {
+        // Ticks 0–4 are the idle lead-in (instant, 20 ms); everything after
+        // answers 300 ms later with a 300 ms round trip.
+        let pinger = ScriptedPinger(internet: { seq in
+            ProbeHost.tick(fromWire: seq) <= 5
+                ? (delay: Duration.zero, outcome: PingOutcome.reply(rttMs: 20))
+                : (delay: Duration.milliseconds(300), outcome: PingOutcome.reply(rttMs: 300))
+        })
+        let engine = MonitorEngine(
+            settings: MonitorSettings(
+                routerHost: "r", internetHost: "i",
+                pingInterval: .milliseconds(50), pingTimeout: .seconds(1),
+                throughputEnabled: false
+            ),
+            pingerFactory: { _, _ in pinger },
+            throughputProvider: FakeThroughput()
+        )
+        let results = Box<ThroughputResult>()
+        let resultStream = await engine.throughputResults()
+        let sampleStream = try await engine.start(warmup: .zero)
+        let sc = Task { for await _ in sampleStream {} }
+        let rc = Task { for await r in resultStream { results.append(r) } }
+
+        try await Task.sleep(for: .milliseconds(260)) // ticks 0–4 done, all quick
+        await engine.runThroughputTestNow(
+            directionDuration: .milliseconds(300),
+            settle: .milliseconds(50),
+            warmup: .milliseconds(20)
+        )
+        await engine.stop()
+        _ = await sc.value
+        _ = await rc.value
+
+        let result = try XCTUnwrap(results.all.first)
+        XCTAssertEqual(try XCTUnwrap(result.idleLatencyMs), 20, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(result.downloadLatencyMs), 300, accuracy: 1e-9,
+                       "replies that landed after the download ended still belong to it")
+        XCTAssertEqual(try XCTUnwrap(result.uploadLatencyMs), 300, accuracy: 1e-9,
+                       "the result waited for the upload's probes to resolve")
+        XCTAssertEqual(try XCTUnwrap(result.bufferbloatMs), 280, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(result.packetLoss), 0, accuracy: 1e-9)
     }
 
     // MARK: - Storage

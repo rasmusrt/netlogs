@@ -226,9 +226,12 @@ public struct PingChartBucketer: Sendable {
         lastTime = nil
     }
 
-    private var allBuckets: [Bucket] {
-        guard let open else { return sealed }
-        return sealed + [open]
+    /// Visits every bucket, sealed then open, without building the
+    /// concatenated array `sealed + [open]` that `series` used to allocate
+    /// three times per publish (once for the ceiling, once per host).
+    private func forEachBucket(_ body: (Int, Bucket) -> Void) {
+        for (index, bucket) in sealed.enumerated() { body(index, bucket) }
+        if let open { body(sealed.count, open) }
     }
 
     /// Emits points for one host, bumping `segment` across any bucket in which
@@ -243,14 +246,14 @@ public struct PingChartBucketer: Sendable {
         ceiling: Double
     ) -> (points: [RTTPoint], clipped: Int) {
         var out: [RTTPoint] = []
-        out.reserveCapacity(capacity)
+        out.reserveCapacity(sealed.count + 1)
         var segment = 0
         var clipped = 0
-        for (index, bucket) in allBuckets.enumerated() {
+        forEachBucket { index, bucket in
             let host = bucket[keyPath: fold]
             guard host.count > 0 else {
                 segment += 1
-                continue
+                return
             }
             if host.hi > ceiling { clipped += 1 }
             out.append(RTTPoint(
@@ -270,13 +273,18 @@ public struct PingChartBucketer: Sendable {
     /// An inferred domain lets one pathological spike — or the documented ICMP
     /// warm-up artefact — flatten the entire trace into the bottom few percent
     /// of the plot. Sorting at most 400 doubles twice a second is not a cost
-    /// worth optimising away.
+    /// worth optimising away; the four intermediate arrays the
+    /// `flatMap`/`filter`/`map`/`sorted` chain built on the way there were, so
+    /// the maxima are now collected into one pre-sized array and sorted in
+    /// place.
     private func yCeiling() -> Double {
-        let maxima = allBuckets
-            .flatMap { [$0.router, $0.internet] }
-            .filter { $0.count > 0 }
-            .map(\.hi)
-            .sorted()
+        var maxima: [Double] = []
+        maxima.reserveCapacity(2 * (sealed.count + 1))
+        forEachBucket { _, bucket in
+            if bucket.router.count > 0 { maxima.append(bucket.router.hi) }
+            if bucket.internet.count > 0 { maxima.append(bucket.internet.hi) }
+        }
+        maxima.sort()
         guard !maxima.isEmpty else { return Self.minimumCeilingMs }
         let index = Swift.min(maxima.count - 1, Int(Double(maxima.count) * 0.95))
         return Swift.max(Self.minimumCeilingMs, (maxima[index] * 1.25).rounded(.up))

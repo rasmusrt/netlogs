@@ -60,7 +60,7 @@ public struct SessionExport: Codable, Sendable {
     }
 
     private static func analysed(_ samples: [PingSample]) -> [PingSample] {
-        samples.filter { $0.id >= PingSample.warmupSampleCount }
+        samples.filter { !$0.isWarmup }
     }
 
     /// The failures the app would show, warm-up excluded — one definition, used

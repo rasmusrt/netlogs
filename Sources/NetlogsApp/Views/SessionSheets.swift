@@ -8,6 +8,14 @@ enum PingHost: String, Hashable, CaseIterable, Identifiable {
     /// The thresholds this host's figures are judged by — a gateway and an
     /// internet host do not deserve the same ramp. See `LatencyGrade.Ramp`.
     var ramp: LatencyGrade.Ramp { self == .router ? .gateway : .internet }
+
+    /// The Latency sheet's host, shared with the card that opens it.
+    ///
+    /// The sheet kind has no payload, so the Router card opened the sheet on
+    /// Internet — the picker's own default — and showed the figures for the
+    /// card you did not click. The card writes this before opening; the
+    /// picker reads and writes the same key.
+    static let latencySheetKey = "latencySheetHost"
 }
 
 /// What a summary card, or the header's failure count, opens.
@@ -114,9 +122,7 @@ struct SessionSheetView: View {
             Divider()
             Group {
                 if isLoading && detail == nil {
-                    ProgressView()
-                        .controlSize(.small)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    LoadingView()
                 } else {
                     content
                 }
@@ -125,9 +131,30 @@ struct SessionSheetView: View {
         // 600, not 660: the window's own minimum is 620, so the old width made
         // the sheet wider than the window it is attached to — which no native
         // app does, and which clipped the title to "atency" at that size.
-        // Height is per sheet; see `SessionSheet.preferredHeight`.
-        .frame(width: 600, height: sheet.preferredHeight)
+        // Height is per sheet; see `SessionSheet.preferredHeight`, capped by
+        // the window behind it.
+        .frame(width: 600, height: height)
     }
+
+    /// The declared height, but never taller than the window behind it.
+    ///
+    /// At the window's default size Speed and Gateway (560) hung below the
+    /// bottom edge of a 530-point window — the same mistake the width comment
+    /// above fixed for 660. The contents scroll, so giving up height costs
+    /// nothing but a scroll.
+    ///
+    /// Read from the window rather than measured in SwiftUI: the detail view's
+    /// own geometry ran 24 points past the window's bottom edge, and the sheet
+    /// hangs from under the toolbar, not from the top of the content. A sheet
+    /// never becomes main, so `mainWindow` is the one it is attached to.
+    private var height: CGFloat {
+        guard let window = NSApp.mainWindow else { return sheet.preferredHeight }
+        let room = window.frame.height - Self.toolbarHeight - Space.s
+        return min(sheet.preferredHeight, max(320, room))
+    }
+
+    /// Where a sheet's top edge lands on macOS 26: under the unified toolbar.
+    private static let toolbarHeight: CGFloat = 52
 
     /// Title leading, close trailing.
     ///
@@ -219,7 +246,7 @@ private struct FailuresDetail: View {
                     TableColumn("Load") { sample in
                         if sample.phase != .idle {
                             Chip(text: sample.phase.rawValue)
-                                .foregroundStyle(Palette.Chart.load(sample.phase))
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -290,12 +317,12 @@ private struct HostOutcome: View {
         if let ms {
             Text(Fmt.msLabel(ms))
                 .font(.tabularSmall)
-                .foregroundStyle(Palette.pill(ms, on: ramp))
+                .foregroundStyle(Palette.latency(ms, on: ramp) ?? .primary)
         } else if let lateMs {
             HStack(spacing: Space.xs) {
                 Text(Fmt.msLabel(lateMs))
                     .font(.tabularSmall)
-                    .foregroundStyle(Palette.pill(lateMs, on: ramp))
+                    .foregroundStyle(Palette.latency(lateMs, on: ramp) ?? .primary)
                 Text("late")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
@@ -313,7 +340,7 @@ private struct HostOutcome: View {
 
 private struct LatencyDetail: View {
     let detail: SessionDetail?
-    @State private var host: PingHost = .internet
+    @AppStorage(PingHost.latencySheetKey) private var host: PingHost = .internet
 
     var body: some View {
         if let detail {
@@ -749,78 +776,6 @@ private struct NetworkDetail: View {
     }
 }
 
-// MARK: - Shared bits
-
-/// One section treatment shared by every sheet, so they read as one surface
-/// rather than four unrelated screens.
-struct DetailSection<Content: View>: View {
-    let title: String
-    @ViewBuilder var content: Content
-
-    init(_ title: String, @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.content = content()
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: Space.s) {
-            Text(title)
-                .font(.cardTitle)
-                .foregroundStyle(.secondary)
-            content
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-struct DetailRow: View {
-    let label: String
-    let value: String
-    var tint: Color?
-    var help: String?
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Spacer(minLength: Space.s)
-            Text(value)
-                .font(.tabularSmall)
-                .foregroundStyle(tint ?? .primary)
-                .textSelection(.enabled)
-        }
-        .helpIfPresent(help)
-    }
-}
-
-
-/// A round close control, matching the one the system puts on its own sheets.
-struct CloseButton: View {
-    var action: () -> Void
-    @State private var hovering = false
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: "xmark")
-                .font(.system(size: 10, weight: .bold))
-                .foregroundStyle(.secondary)
-                .frame(width: 22, height: 22)
-                .background(hovering ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.quaternary),
-                            in: Circle())
-                .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering = $0 }
-        .pointerStyle(.link)
-        // Escape already dismisses a sheet; this makes Return work too, so the
-        // sheet closes on whichever key the hand reaches for first.
-        .keyboardShortcut(.defaultAction)
-        .accessibilityLabel("Close")
-        .help("Close")
-    }
-}
-
 // MARK: - Traffic
 
 /// What this Mac was sending when latency diverged.
@@ -928,3 +883,4 @@ private struct TrafficDetail: View {
             .foregroundStyle(.tertiary)
     }
 }
+

@@ -32,6 +32,9 @@ final class AppSettings {
     /// existing preferences blob still decodes, the same precedent
     /// `detailMode` set.
     var analysisRange: AnalysisRange { didSet { persist() } }
+    /// Shows the redesigned Monitor screen instead of the current one. Off by
+    /// default; optional in `Stored` for the same reason as `analysisRange`.
+    var monitorV2Beta: Bool { didSet { persist() } }
 
     private static let key = "netlogs.settings.v1"
 
@@ -41,6 +44,7 @@ final class AppSettings {
         var retentionDays: Int
         var detailMode: DetailMode?
         var analysisRange: AnalysisRange?
+        var monitorV2Beta: Bool?
     }
 
     init() {
@@ -51,19 +55,21 @@ final class AppSettings {
             retentionDays = saved.retentionDays
             detailMode = saved.detailMode ?? .summary
             analysisRange = saved.analysisRange ?? .week
+            monitorV2Beta = saved.monitorV2Beta ?? false
         } else {
             monitor = .uiDefault
             theme = .system
             retentionDays = 30
             detailMode = .summary
             analysisRange = .week
+            monitorV2Beta = false
         }
     }
 
     private func persist() {
         let stored = Stored(monitor: monitor, theme: theme,
                             retentionDays: retentionDays, detailMode: detailMode,
-                            analysisRange: analysisRange)
+                            analysisRange: analysisRange, monitorV2Beta: monitorV2Beta)
         if let data = try? JSONEncoder().encode(stored) {
             UserDefaults.standard.set(data, forKey: Self.key)
         }

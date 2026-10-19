@@ -12,6 +12,16 @@ public struct SessionAnalysis: Sendable, Equatable, Identifiable {
     public let throughput: [ThroughputResult]
     public let radio: RadioSummary
 
+    /// Computed once, here, rather than on every read.
+    ///
+    /// This was a computed property, and it is read a great many times per
+    /// result: once per table row, once per spread mark, and inside most of
+    /// the diagnosis rules — several of which read it for every session in
+    /// every group. Each read sorted the throughput results for the median
+    /// and walked the histogram for p50. Every input is an immutable stored
+    /// property, so the answer cannot change after `init`; it is stored.
+    public let score: ScoreResult
+
     public var id: UUID { session.id }
 
     public init(
@@ -26,6 +36,8 @@ public struct SessionAnalysis: Sendable, Equatable, Identifiable {
         self.latency = latency
         self.throughput = throughput
         self.radio = radio
+        self.score = Self.evaluateScore(session: session, aggregate: aggregate,
+                                        latency: latency, throughput: throughput)
     }
 
     // MARK: - What was measured, against what was claimed
@@ -36,18 +48,41 @@ public struct SessionAnalysis: Sendable, Equatable, Identifiable {
     /// sample rather than *now* — six of twenty sessions in a real database were
     /// never stopped cleanly, and measuring those against the clock would
     /// withhold every one of them.
-    public var expectedSamples: Int {
+    public var expectedSamples: Int { Self.expectedSampleCount(session: session, aggregate: aggregate) }
+
+    /// Stored samples over expected. Below 1 the Mac stopped measuring — a
+    /// closed lid, a forced sleep — and the session describes a
+    /// differently-shaped day than the one it claims.
+    public var coverage: Double { Self.coverageRatio(session: session, aggregate: aggregate) }
+
+    // The derivations behind the properties above, in a form `init` can call
+    // before `self` exists. The instance properties are thin wrappers so the
+    // rules and the views keep reading the names they always did.
+
+    private static func expectedSampleCount(session: SessionState, aggregate: PingAggregate) -> Int {
         let interval = session.settings.pingInterval.timeInterval
         guard interval > 0 else { return aggregate.totalSamples }
         let claimed = Swift.max(session.duration, aggregate.measuredSpan)
         return Swift.max(1, Int((claimed / interval).rounded()))
     }
 
-    /// Stored samples over expected. Below 1 the Mac stopped measuring — a
-    /// closed lid, a forced sleep — and the session describes a
-    /// differently-shaped day than the one it claims.
-    public var coverage: Double {
-        Swift.min(1, Double(aggregate.totalSamples) / Double(expectedSamples))
+    private static func coverageRatio(session: SessionState, aggregate: PingAggregate) -> Double {
+        Swift.min(1, Double(aggregate.totalSamples)
+                     / Double(expectedSampleCount(session: session, aggregate: aggregate)))
+    }
+
+    private static func lossRatio(aggregate: PingAggregate) -> Double {
+        aggregate.totalSamples > 0
+            ? Double(aggregate.internetNoRepliesIdle) / Double(aggregate.totalSamples) : 0
+    }
+
+    private static func medianBufferbloat(throughput: [ThroughputResult]) -> Double? {
+        let measured = throughput.compactMap(\.bufferbloatMs).sorted()
+        guard !measured.isEmpty else { return nil }
+        let middle = measured.count / 2
+        return measured.count.isMultiple(of: 2)
+            ? (measured[middle - 1] + measured[middle]) / 2
+            : measured[middle]
     }
 
     // MARK: - The figures the rules read
@@ -59,10 +94,7 @@ public struct SessionAnalysis: Sendable, Equatable, Identifiable {
     /// screen and the session header grade the same night differently. Replies
     /// that arrived after the deadline are not loss, and timeouts caused by the
     /// app's own throughput test are loss the app caused.
-    public var internetLossRatio: Double {
-        aggregate.totalSamples > 0
-            ? Double(aggregate.internetNoRepliesIdle) / Double(aggregate.totalSamples) : 0
-    }
+    public var internetLossRatio: Double { Self.lossRatio(aggregate: aggregate) }
 
     public var routerLossRatio: Double {
         aggregate.totalSamples > 0
@@ -83,38 +115,38 @@ public struct SessionAnalysis: Sendable, Equatable, Identifiable {
 
     /// Median rather than mean. `ThroughputAverages` stays a mean and is right
     /// for the card; a rule that fires advice must not swing on one outlier.
-    public var medianBufferbloatMs: Double? {
-        let measured = throughput.compactMap(\.bufferbloatMs).sorted()
-        guard !measured.isEmpty else { return nil }
-        let middle = measured.count / 2
-        return measured.count.isMultiple(of: 2)
-            ? (measured[middle - 1] + measured[middle]) / 2
-            : measured[middle]
-    }
+    public var medianBufferbloatMs: Double? { Self.medianBufferbloat(throughput: throughput) }
 
     // MARK: - Score
 
     /// `.withheld` rather than a guess, on the same discipline as
-    /// `SessionVerdict.insufficientData`.
-    public var score: ScoreResult {
+    /// `SessionVerdict.insufficientData`. The result is the stored `score`.
+    private static func evaluateScore(
+        session: SessionState, aggregate: PingAggregate,
+        latency: LatencyHistogram, throughput: [ThroughputResult]
+    ) -> ScoreResult {
         guard aggregate.totalSamples >= SessionVerdict.minimumSamples else {
             return .withheld(.tooFewSamples(aggregate.totalSamples))
         }
-        guard coverage >= Scoring.coverageFloor else {
+        guard coverageRatio(session: session, aggregate: aggregate) >= Scoring.coverageFloor else {
             return .withheld(.poorCoverage(measured: aggregate.totalSamples,
-                                           expected: expectedSamples))
+                                           expected: expectedSampleCount(session: session,
+                                                                     aggregate: aggregate)))
         }
 
+        let loss = lossRatio(aggregate: aggregate)
         var components: [ScoreComponent] = [
             ScoreComponent(kind: .loss,
-                           value: Scoring.loss(ratio: internetLossRatio,
+                           value: Scoring.loss(ratio: loss,
                                                failures: aggregate.internetNoRepliesIdle),
-                           measurement: internetLossRatio)
+                           measurement: loss)
         ]
         if latency.count > 0 {
+            // One histogram walk, where the two reads below used to be two.
+            let p50 = latency.p50
             components.append(ScoreComponent(kind: .latency,
-                                             value: Scoring.latency(p50Ms: latency.p50),
-                                             measurement: latency.p50))
+                                             value: Scoring.latency(p50Ms: p50),
+                                             measurement: p50))
         }
         // Jitter needs pairs, not samples: "no pair yet" and "the replies
         // agreed" are different facts, and only the second is a measurement.
@@ -123,7 +155,7 @@ public struct SessionAnalysis: Sendable, Equatable, Identifiable {
                                              value: Scoring.jitter(ms: jitter),
                                              measurement: jitter))
         }
-        if let bloat = medianBufferbloatMs {
+        if let bloat = medianBufferbloat(throughput: throughput) {
             components.append(ScoreComponent(kind: .bufferbloat,
                                              value: Scoring.bufferbloat(ms: bloat),
                                              measurement: bloat))
@@ -152,40 +184,55 @@ public struct RangeAnalysis: Sendable, Equatable {
     /// first hop was slow in those hours too, which would make it a local
     /// problem rather than an upstream one.
     public let routerHourlyBuckets: [HourlyBucket]
-
-    public init(interval: DateInterval, sessions: [SessionAnalysis],
-                hourlyBuckets: [HourlyBucket] = [],
-                routerHourlyBuckets: [HourlyBucket] = []) {
-        self.interval = interval
-        self.sessions = sessions.sorted { $0.session.startedAt > $1.session.startedAt }
-        self.hourlyBuckets = hourlyBuckets
-        self.routerHourlyBuckets = routerHourlyBuckets
-    }
+    /// Loss and jitter per session, day and hour, for the Analysis chart.
+    public let hourlyPingStats: [HourlyPingStats]
 
     /// Sessions worth judging: enough samples, and enough of the claim actually
     /// measured. Everything except the coverage rule itself reads this.
-    public var qualifying: [SessionAnalysis] {
-        sessions.filter {
-            $0.aggregate.totalSamples >= SessionVerdict.minimumSamples
-                && $0.coverage >= Scoring.coverageFloor
-        }
-    }
+    public let qualifying: [SessionAnalysis]
 
-    public var underCovered: [SessionAnalysis] {
-        sessions.filter {
-            $0.aggregate.totalSamples >= SessionVerdict.minimumSamples
-                && $0.coverage < Scoring.coverageFloor
-        }
-    }
+    public let underCovered: [SessionAnalysis]
 
     /// Qualifying sessions grouped by internet host, then by gateway — the two
     /// axes along which a figure changes what it describes.
-    public var byTarget: [TargetGroup] {
+    ///
+    /// Stored, with the two above. These were computed properties, and every
+    /// read regrouped and re-sorted the sessions — then built each group's
+    /// hour-of-day profiles, which is 48 histogram merges over every hourly
+    /// bucket in the range. The Analysis screen reads `byTarget` four times in
+    /// one body pass and nine rules read it once each, so one load of the
+    /// screen was doing that grouping a dozen times over, and every click on a
+    /// finding did it again. A range is immutable once built, so once is right.
+    public let byTarget: [TargetGroup]
+
+    public init(interval: DateInterval, sessions: [SessionAnalysis],
+                hourlyBuckets: [HourlyBucket] = [],
+                routerHourlyBuckets: [HourlyBucket] = [],
+                hourlyPingStats: [HourlyPingStats] = []) {
+        self.interval = interval
+        self.hourlyPingStats = hourlyPingStats
+        let sorted = sessions.sorted { $0.session.startedAt > $1.session.startedAt }
+        self.sessions = sorted
+        self.hourlyBuckets = hourlyBuckets
+        self.routerHourlyBuckets = routerHourlyBuckets
+
+        var qualifying: [SessionAnalysis] = []
+        var underCovered: [SessionAnalysis] = []
+        for analysis in sorted where analysis.aggregate.totalSamples >= SessionVerdict.minimumSamples {
+            if analysis.coverage >= Scoring.coverageFloor {
+                qualifying.append(analysis)
+            } else {
+                underCovered.append(analysis)
+            }
+        }
+        self.qualifying = qualifying
+        self.underCovered = underCovered
+
         let groups = Dictionary(grouping: qualifying) {
             TargetKey(internetHost: $0.session.settings.internetHost,
                       routerHost: $0.session.settings.routerHost)
         }
-        return groups
+        self.byTarget = groups
             .map { TargetGroup(key: $0.key, sessions: $0.value,
                                hourlyBuckets: hourlyBuckets,
                                routerHourlyBuckets: routerHourlyBuckets) }
@@ -215,8 +262,21 @@ public struct TargetKey: Sendable, Equatable, Hashable {
 public struct TargetGroup: Sendable, Equatable, Identifiable {
     public let key: TargetKey
     public let sessions: [SessionAnalysis]
-    let hourlyBuckets: [HourlyBucket]
-    let routerHourlyBuckets: [HourlyBucket]
+
+    /// This target's hours only — never pooled with another host's.
+    ///
+    /// Built once in `init`, from the buckets that belong to this group's
+    /// sessions. As a computed property it re-filtered every bucket in the
+    /// range and merged 24 histograms on each read, and it is read on every
+    /// Analysis body pass (twice) and by the time-of-day rule.
+    public let hourProfile: HourOfDayProfile
+
+    /// The same hours measured against the router, for the check that keeps a
+    /// congestion claim honest.
+    public let routerHourProfile: HourOfDayProfile
+
+    /// Every scored session's score, in session order.
+    public let scores: [NetworkScore]
 
     public var id: TargetKey { key }
 
@@ -225,22 +285,14 @@ public struct TargetGroup: Sendable, Equatable, Identifiable {
                 routerHourlyBuckets: [HourlyBucket] = []) {
         self.key = key
         self.sessions = sessions
-        self.hourlyBuckets = hourlyBuckets
-        self.routerHourlyBuckets = routerHourlyBuckets
+        // The buckets themselves are not kept: the profiles are the only thing
+        // ever read from them, and a group holding a copy of every bucket in
+        // the range was a reference the range already holds.
+        let ids = Set(sessions.map(\.id))
+        self.hourProfile = HourOfDayProfile.build(hourlyBuckets, sessionIDs: ids)
+        self.routerHourProfile = HourOfDayProfile.build(routerHourlyBuckets, sessionIDs: ids)
+        self.scores = sessions.compactMap { $0.score.score }
     }
-
-    /// This target's hours only — never pooled with another host's.
-    public var hourProfile: HourOfDayProfile {
-        HourOfDayProfile.build(hourlyBuckets, sessionIDs: Set(sessions.map(\.id)))
-    }
-
-    /// The same hours measured against the router, for the check that keeps a
-    /// congestion claim honest.
-    public var routerHourProfile: HourOfDayProfile {
-        HourOfDayProfile.build(routerHourlyBuckets, sessionIDs: Set(sessions.map(\.id)))
-    }
-
-    public var scores: [NetworkScore] { sessions.compactMap { $0.score.score } }
 
     /// The median score with its count — never a blend, and never presented
     /// without saying how many sessions it is the median of.

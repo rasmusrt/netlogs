@@ -17,16 +17,15 @@ public struct LatencyHistogram: Sendable, Equatable {
     }
 
     public mutating func add(_ milliseconds: Double) {
-        let index: Int
-        if milliseconds >= 1000 {
-            index = Self.overflowIndex
-        } else if milliseconds <= 0 {
-            index = 0
-        } else {
-            index = Int(milliseconds) // floor; e.g. 12.9 ms → bucket 12
-        }
-        buckets[index] += 1
-        count += 1
+        add(milliseconds, count: 1)
+    }
+
+    /// Which bucket a latency lands in: floor of the millisecond value, so
+    /// 12.9 ms → bucket 12; ≥ 1000 ms → the overflow bucket; ≤ 0 → bucket 0.
+    private static func bucketIndex(for milliseconds: Double) -> Int {
+        if milliseconds >= 1000 { return overflowIndex }
+        if milliseconds <= 0 { return 0 }
+        return Int(milliseconds)
     }
 
     /// Bulk insert of a bucket that was counted elsewhere — the shape a
@@ -38,15 +37,7 @@ public struct LatencyHistogram: Sendable, Equatable {
     /// percentile would be two chances to disagree.
     public mutating func add(_ milliseconds: Double, count occurrences: Int) {
         guard occurrences > 0 else { return }
-        let index: Int
-        if milliseconds >= 1000 {
-            index = Self.overflowIndex
-        } else if milliseconds <= 0 {
-            index = 0
-        } else {
-            index = Int(milliseconds)
-        }
-        buckets[index] += occurrences
+        buckets[Self.bucketIndex(for: milliseconds)] += occurrences
         count += occurrences
     }
 

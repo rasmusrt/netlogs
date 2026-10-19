@@ -51,6 +51,7 @@ struct NetlogsScene: App {
     /// Opened once at launch; a failure here is shown instead of the UI.
     @State private var store = Result { try SessionStore(url: try SessionStore.defaultURL()) }
     @State private var settings = AppSettings()
+    @State private var updater = Updater()
 
     var body: some Scene {
         // `Window`, not `WindowGroup` — a single-window utility, no ⌘N.
@@ -88,6 +89,7 @@ struct NetlogsScene: App {
             // inert, and it was the reason this looked unfixable.
             .toolbarBackground(.hidden, for: .windowToolbar)
             .preferredColorScheme(settings.theme.colorScheme)
+            .environment(updater)
         }
         .windowResizability(.contentMinSize)
         // SwiftUI persists whether a `Window` scene was open at quit. Close the
@@ -97,6 +99,10 @@ struct NetlogsScene: App {
         .defaultLaunchBehavior(.presented)
         .commands {
             CommandGroup(replacing: .newItem) {} // no "New Window"
+            // Where every Mac app keeps it: under "About", in the app menu.
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") { updater.checkFromMenu() }
+            }
             // The mode switch also lives in the toolbar, but a segmented
             // control collapses into the overflow menu on a narrow window —
             // so the menu is where the shortcuts actually belong.
@@ -117,6 +123,7 @@ struct NetlogsScene: App {
         Settings {
             SettingsScreen(settings: settings, store: try? store.get())
                 .preferredColorScheme(settings.theme.colorScheme)
+                .environment(updater)
         }
     }
 }

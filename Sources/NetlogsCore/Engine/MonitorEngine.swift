@@ -82,6 +82,7 @@ public actor MonitorEngine {
         pinger = p
         emitNext = 0
         holdback.removeAll()
+        lastEmittedAt = nil
 
         let (stream, cont) = AsyncStream<PingSample>.makeStream(bufferingPolicy: .bufferingNewest(600))
         continuation = cont
@@ -142,6 +143,7 @@ public actor MonitorEngine {
         throughputContinuation?.finish()
         throughputContinuation = nil
         holdback.removeAll()
+        lastEmittedAt = nil
         recentSamples.removeAll()
         consecutiveTotalFailures = 0
         currentPhase = .idle
@@ -242,6 +244,17 @@ public actor MonitorEngine {
         let ulEnd = Date()
         currentPhase = .idle
 
+        // The probes sent in the last seconds of the upload are still in
+        // flight here, and they are the slowest ones by construction: a reply
+        // that takes two seconds, or never comes, has not reached
+        // `recentSamples` yet when the transfer stops. Reading the upload
+        // window now dropped exactly the tail the test exists to measure —
+        // every load figure was an average of the probes that happened to
+        // come back quickly. So wait for the in-flight probes to resolve
+        // first; `drainInFlight` knows when that is because samples leave in
+        // tick order.
+        await drainInFlight(scheduledBefore: ulEnd)
+
         guard throughputContinuation != nil else { return } // stopped mid-test
 
         // Full spread for the load phases too. These used a `latencyMean`
@@ -249,18 +262,24 @@ public actor MonitorEngine {
         // already computing everything it did, and more.
         let dlStats = latencyStats(phase: .downloading, from: dlStart, to: dlEnd)
         let ulStats = latencyStats(phase: .uploading, from: ulStart, to: ulEnd)
-        let dlLatency = dlStats.mean
-        let ulLatency = ulStats.mean
 
+        // Optionals straight through. This used to write `idle ?? 0` and
+        // `dlLatency ?? idle ?? 0`, which schema 5 was created to undo on
+        // disk but which kept being produced here: an idle window with no
+        // replies became a 0 ms baseline (so the whole load latency read as
+        // bufferbloat), and a load window with no replies borrowed the idle
+        // figure (so a link that stopped answering under load read as
+        // 0 ms bufferbloat, "excellent"). A window that measured nothing is
+        // `nil`, and `ThroughputResult` already knows what to do with that.
         throughputContinuation?.yield(
             ThroughputResult(
                 downloadMbps: download.mbps,
                 uploadMbps: upload.mbps,
                 bytesDownloaded: download.bytes,
                 bytesUploaded: upload.bytes,
-                idleLatencyMs: idle ?? 0,
-                downloadLatencyMs: dlLatency ?? idle ?? 0,
-                uploadLatencyMs: ulLatency ?? idle ?? 0,
+                idleLatencyMs: idle,
+                downloadLatencyMs: dlStats.mean,
+                uploadLatencyMs: ulStats.mean,
                 idleJitterMs: idleStats.jitter,
                 packetLoss: lossFraction(from: idleFrom, to: ulEnd),
                 idleLowMs: idleStats.low,
@@ -306,7 +325,7 @@ public actor MonitorEngine {
         // timeout — a baseline wrong in both directions, feeding the one
         // subtraction the Speed card leads with.
         for sample in recentSamples
-        where sample.id >= PingSample.warmupSampleCount
+        where !sample.isWarmup
             && sample.phase == phase && sample.timestamp >= from && sample.timestamp <= to {
             if let ms = sample.internetMs { stats.add(ms) } else { stats.markGap() }
         }
@@ -320,7 +339,11 @@ public actor MonitorEngine {
     /// rather than only its idle lead-in.
     private func lossFraction(from: Date, to: Date) -> Double? {
         var total = 0, lost = 0
-        for sample in recentSamples where sample.timestamp >= from && sample.timestamp <= to {
+        // Same warm-up exclusion as `latencyStats`: the first ticks carry the
+        // socket warm-up and are kept out of every figure a test reports.
+        for sample in recentSamples
+        where sample.id >= PingSample.warmupSampleCount
+            && sample.timestamp >= from && sample.timestamp <= to {
             total += 1
             if sample.internetMs == nil { lost += 1 }
         }
@@ -345,6 +368,23 @@ public actor MonitorEngine {
 
     private func tick(id: UInt32, scheduledAt: Date) async {
         guard continuation != nil else { return }
+
+        // The phase is read *before* the probes go out, not after they come
+        // back. It used to be read after, which tagged a probe by the state of
+        // the engine at the moment its reply arrived — and the replies that
+        // arrive last are the slow ones. A probe sent in the final seconds of
+        // an upload that then timed out resolved two to five seconds later,
+        // by which time the test was over, so the timeout was tagged `idle`
+        // and counted as real packet loss: self-inflicted queueing reported
+        // as a network fault, the exact thing the tag exists to prevent. The
+        // same slip excluded the slowest loaded replies from the load window
+        // and left the "under load" latency an average of the quick ones.
+        //
+        // Sticky in the other direction too: a probe sent idle that is still
+        // in flight when the transfer begins is answered through a loaded
+        // queue, so if the engine is under load at either end of its life, the
+        // sample is under load.
+        let phaseAtSend = currentPhase
 
         let router: Double?
         let internet: Double?
@@ -385,7 +425,7 @@ public actor MonitorEngine {
             id: id, timestamp: scheduledAt,
             routerMs: router, internetMs: internet,
             routerLateMs: routerLate, internetLateMs: internetLate,
-            phase: currentPhase
+            phase: phaseAtSend != .idle ? phaseAtSend : currentPhase
         )
         holdback[id] = sample
 
@@ -427,7 +467,26 @@ public actor MonitorEngine {
         guard let continuation else { return }
         while let sample = holdback.removeValue(forKey: emitNext) {
             continuation.yield(sample)
+            lastEmittedAt = sample.timestamp
             emitNext &+= 1
+        }
+    }
+
+    /// Scheduled time of the newest sample released to the stream. Because
+    /// samples leave in tick order, a sample scheduled at or after some
+    /// instant having been emitted proves every probe scheduled before that
+    /// instant has resolved.
+    private var lastEmittedAt: Date?
+
+    /// Wait until every probe scheduled before `until` has resolved, or until
+    /// the longest a probe can possibly take has passed — the ping timeout
+    /// plus the pinger's grace window — whichever comes first. Returns early
+    /// if the engine stops meanwhile.
+    private func drainInFlight(scheduledBefore until: Date) async {
+        let longestProbe = settings.pingTimeout + ICMPPinger.graceDefault + .seconds(1)
+        let giveUpAt = Date().addingTimeInterval(longestProbe.timeInterval)
+        while continuation != nil, (lastEmittedAt ?? .distantPast) < until, Date() < giveUpAt {
+            try? await Task.sleep(for: .milliseconds(100))
         }
     }
 }

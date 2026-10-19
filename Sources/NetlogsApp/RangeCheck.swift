@@ -94,7 +94,7 @@ enum RangeCheck {
             var mismatches = 0
             for analysis in range.qualifying.prefix(5) {
                 let samples = try store.samples(for: analysis.id)
-                    .filter { $0.id >= PingSample.warmupSampleCount }
+                    .filter { !$0.isWarmup }
                 var builder = LiveSummaryBuilder()
                 for sample in samples { builder.add(sample) }
                 let swift = builder.summary

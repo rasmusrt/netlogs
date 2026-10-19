@@ -129,10 +129,10 @@ struct GatewayDetail: View {
             ForEach(trace.rates) { r in
                 AreaMark(x: .value("Time", r.start), y: .value("Up", r.upMbps),
                          series: .value("Series", "up-\(r.segment)"))
-                    .foregroundStyle(Palette.Chart.uploadBand.opacity(0.55))
+                    .foregroundStyle(Palette.Chart.internet.opacity(0.35))
                 AreaMark(x: .value("Time", r.end), y: .value("Up", r.upMbps),
                          series: .value("Series", "up-\(r.segment)"))
-                    .foregroundStyle(Palette.Chart.uploadBand.opacity(0.55))
+                    .foregroundStyle(Palette.Chart.internet.opacity(0.35))
             }
             changeMarks
             hoverMark
@@ -147,8 +147,8 @@ struct GatewayDetail: View {
                 LineMark(x: .value("Time", p.time), y: .value("SINR", p.sinr),
                          series: .value("Series", "sinr-\(p.segment)"))
                     .interpolationMethod(.stepEnd)
-                    .foregroundStyle(Palette.good)
-                    .lineStyle(StrokeStyle(lineWidth: 1.5))
+                    .foregroundStyle(Palette.Chart.internet)
+                    .lineStyle(StrokeStyle(lineWidth: 1.2))
             }
             changeMarks
             hoverMark

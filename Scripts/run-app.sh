@@ -21,7 +21,7 @@ done
 # and a bare `pgrep -x Netlogs` sees it and refuses to launch.
 if [ "$HEADLESS" -eq 0 ] && {
      pgrep -x NetlogsApp >/dev/null ||
-     pgrep -f "$HOME/Applications/Netlogs.app/Contents/MacOS/Netlogs" >/dev/null
+     pgrep -f "$HOME/Applications/Netlogs Beta.app/Contents/MacOS/Netlogs" >/dev/null
    }; then
   echo "Netlogs is already running — quit it first (⌘Q)." >&2
   exit 1

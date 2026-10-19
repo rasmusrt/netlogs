@@ -180,7 +180,7 @@ struct SamplesTable: View {
             HStack(spacing: 0) {
                 if sample.phase != .idle {
                     Chip(text: sample.phase.rawValue)
-                        .foregroundStyle(Palette.Chart.load(sample.phase))
+                        .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
             }
@@ -219,14 +219,13 @@ struct SamplesTable: View {
     }
 }
 
-/// One round-trip time, as a tinted pill.
+/// One round-trip time: plain when it is fine, a tinted pill when it is not.
 ///
-/// Every value is tinted, not just the bad ones. The first pass only coloured
-/// outliers on the theory that colouring everything would bury them — but in
-/// practice a wall of uncoloured numbers is what buries them, and a green pill
-/// carries real information: it says "this one is fine" without being read.
-/// Scanning the column becomes a colour task instead of a numeric one, which is
-/// the whole point of having a log on screen.
+/// Every value used to be a pill, green when fine. Over a real session that is
+/// a column that is ~95% green, which reads as decoration and competes with
+/// everything else on screen. Plain numbers with the occasional pill make the
+/// column scan the same way — the eye goes straight to the colour — and leave
+/// colour meaning one thing: look here.
 private struct RTTCell: View {
     let ms: Double?
     /// RTT of a reply that arrived after the deadline. Rendered as the number
@@ -245,7 +244,11 @@ private struct RTTCell: View {
 
     var body: some View {
         if let ms {
-            pill(ms, tint: Palette.pill(ms, on: ramp), suffix: "ms")
+            if let tint = Palette.latency(ms, on: ramp) {
+                pill(ms, tint: tint, suffix: "ms")
+            } else {
+                plain(ms)
+            }
         } else if let lateMs {
             // Warning, not critical. The link answered; it answered slowly.
             pill(lateMs, tint: Palette.bad, suffix: "ms late")
@@ -257,6 +260,16 @@ private struct RTTCell: View {
                 .padding(.vertical, 2)
                 .background(Palette.fill(Palette.critical), in: Capsule())
         }
+    }
+
+    /// Same metrics as `pill`, so a value lines up whether or not it is tinted.
+    private func plain(_ value: Double) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 2) {
+            Text(Fmt.ms(value)).font(.tabularSmall)
+            Text("ms").font(.system(size: 9)).foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, Space.s - 1)
+        .padding(.vertical, 2)
     }
 
     private func pill(_ value: Double, tint: Color, suffix: String) -> some View {

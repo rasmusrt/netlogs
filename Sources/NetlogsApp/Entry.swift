@@ -6,6 +6,9 @@ enum Entry {
         if CommandLine.arguments.contains("--selftest") {
             SelfTest.runBlocking() // never returns
         }
+        if CommandLine.arguments.contains("--snapshots") {
+            Snapshots.runBlocking() // never returns
+        }
         if CommandLine.arguments.contains("--uicheck") {
             UICheck.runBlocking() // never returns
         }

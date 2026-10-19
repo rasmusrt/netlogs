@@ -41,16 +41,15 @@ enum AnalysisLoader {
             let aggregates = try store.pingAggregates(for: ids)
             let histograms = try store.latencyHistograms(for: ids)
 
-            var throughput: [UUID: [ThroughputResult]] = [:]
-            var radio: [UUID: RadioSummary] = [:]
-            for id in ids {
-                throughput[id] = (try? store.throughputResults(for: id)) ?? []
-                // Decoded through the model's own Codable conformance rather
-                // than picked apart with json_extract, so this screen and the
-                // Network sheet cannot read one row differently. About 3,000
-                // rows for a whole database.
-                radio[id] = RadioSummary.build((try? store.diagnostics(for: id)) ?? [])
-            }
+            // One query each for every session in the range, not one per
+            // session: a year of history is a few hundred sessions.
+            let throughput = (try? store.throughputResults(for: ids)) ?? [:]
+            // Decoded through the model's own Codable conformance rather
+            // than picked apart with json_extract, so this screen and the
+            // Network sheet cannot read one row differently. About 3,000
+            // rows for a whole database.
+            let radio = ((try? store.diagnostics(for: ids)) ?? [:])
+                .mapValues(RadioSummary.build)
 
             let analyses = sessions.compactMap { session -> SessionAnalysis? in
                 guard let aggregate = aggregates[session.id] else { return nil }
@@ -65,9 +64,11 @@ enum AnalysisLoader {
 
             let hourly = (try? store.hourlyBuckets(for: ids)) ?? []
             let routerHourly = (try? store.hourlyBuckets(for: ids, host: .router)) ?? []
+            let hourlyStats = (try? store.hourlyPingStats(for: ids)) ?? []
             let analysis = RangeAnalysis(interval: interval, sessions: analyses,
                                          hourlyBuckets: hourly,
-                                         routerHourlyBuckets: routerHourly)
+                                         routerHourlyBuckets: routerHourly,
+                                         hourlyPingStats: hourlyStats)
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds
                                  - began.uptimeNanoseconds) / 1_000_000
             return AnalysisResult(range: analysis,

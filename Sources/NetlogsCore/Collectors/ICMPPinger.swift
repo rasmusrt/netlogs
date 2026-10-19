@@ -67,6 +67,15 @@ public final class ICMPPinger: ICMPPinging, @unchecked Sendable {
     /// In-flight requests keyed by (peer address, 16-bit wire sequence).
     private var pending: [Key: Pending] = [:]
 
+    /// The `recvfrom` scratch buffer, allocated once.
+    ///
+    /// `drain` used to allocate and zero-fill a fresh 64 KB array on every
+    /// read-source firing — at least once per reply, so two or more times a
+    /// second for the whole session, and far more during a burst of replies
+    /// from other processes' pings (which the kernel also delivers here).
+    /// Touched only on `queue`, like everything else above.
+    private var receiveBuffer = [UInt8](repeating: 0, count: 65_536)
+
     private struct Key: Hashable {
         let addrKey: [UInt8]
         let sequence: UInt16
@@ -207,19 +216,27 @@ public final class ICMPPinger: ICMPPinging, @unchecked Sendable {
         let needV4 = destinations.values.contains { $0.family == .v4 }
         let needV6 = destinations.values.contains { $0.family == .v6 }
 
-        if needV4 {
-            fdV4 = try makeSocket(.v4)
-            srcV4 = makeReadSource(fd: fdV4, family: .v4)
+        // Both sockets first, then both sources, then resume. The sources
+        // used to be created one socket at a time, so a v6 `socket()` failure
+        // after a v4 success cancelled and released a read source that had
+        // never been resumed — and libdispatch aborts the process on the
+        // release of a suspended object. Creating a source is now the last
+        // thing that can't fail, and nothing is released before it has run.
+        var v4: Int32 = -1
+        var v6: Int32 = -1
+        do {
+            if needV4 { v4 = try makeSocket(.v4) }
+            if needV6 { v6 = try makeSocket(.v6) }
+        } catch {
+            // Only the v4 socket can be open here: v6 is the last call that
+            // can throw, and it throws before assigning.
+            if v4 >= 0 { Darwin.close(v4) }
+            throw error
         }
-        if needV6 {
-            do {
-                fdV6 = try makeSocket(.v6)
-            } catch {
-                closeLocked()
-                throw error
-            }
-            srcV6 = makeReadSource(fd: fdV6, family: .v6)
-        }
+        fdV4 = v4
+        fdV6 = v6
+        if v4 >= 0 { srcV4 = makeReadSource(fd: v4, family: .v4) }
+        if v6 >= 0 { srcV6 = makeReadSource(fd: v6, family: .v6) }
 
         isOpen = true
         srcV4?.resume()
@@ -228,10 +245,18 @@ public final class ICMPPinger: ICMPPinging, @unchecked Sendable {
 
     private func closeLocked() {
         isOpen = false
+        // The descriptors are closed by the sources' cancel handlers, not
+        // here. libdispatch's contract for a read source is that its
+        // descriptor stays open until the cancel handler has run; closing it
+        // first, as this did, frees the number for the very next `socket()`
+        // call — which is what `MonitorEngine.rebuildPinger` makes
+        // immediately after this returns — while the old source may still be
+        // registered on it. Forgetting the number here is enough: `drain`
+        // checks for `-1` before reading.
         srcV4?.cancel(); srcV4 = nil
         srcV6?.cancel(); srcV6 = nil
-        if fdV4 >= 0 { Darwin.close(fdV4); fdV4 = -1 }
-        if fdV6 >= 0 { Darwin.close(fdV6); fdV6 = -1 }
+        fdV4 = -1
+        fdV6 = -1
         for (_, p) in pending {
             p.deadline.cancel()
             p.continuation.resume(returning: .failure("pinger closed"))
@@ -258,6 +283,8 @@ public final class ICMPPinger: ICMPPinging, @unchecked Sendable {
     private func makeReadSource(fd: Int32, family: Family) -> DispatchSourceRead {
         let rs = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         rs.setEventHandler { [self] in drain(family: family) }
+        // Owns the descriptor from here on — see `closeLocked`.
+        rs.setCancelHandler { Darwin.close(fd) }
         return rs
     }
 
@@ -296,19 +323,18 @@ public final class ICMPPinger: ICMPPinging, @unchecked Sendable {
     private func drain(family: Family) {
         let fd = (family == .v4) ? fdV4 : fdV6
         guard fd >= 0 else { return }
-        var buffer = [UInt8](repeating: 0, count: 65_536)
         while true {
             var peer = sockaddr_storage()
             var peerLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
             let n = withUnsafeMutablePointer(to: &peer) { pp in
                 pp.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    buffer.withUnsafeMutableBytes { buf in
+                    receiveBuffer.withUnsafeMutableBytes { buf in
                         recvfrom(fd, buf.baseAddress, buf.count, 0, sa, &peerLen)
                     }
                 }
             }
             if n <= 0 { break } // EWOULDBLOCK / EAGAIN when drained
-            handlePacket(buffer, count: n, family: family, peer: peer)
+            handlePacket(receiveBuffer, count: n, family: family, peer: peer)
         }
     }
 

@@ -72,17 +72,39 @@ final class SessionDetail: Sendable {
 }
 
 enum DetailLoader {
+    /// Everything stored for one session. `load` and `export` read the same
+    /// rows; this is the one place that says which.
+    private struct StoredSession {
+        let session: SessionState
+        let samples: [PingSample]
+        let throughput: [ThroughputResult]
+        let diagnostics: [DiagnosticsSnapshot]
+        let traffic: [TrafficCapture]
+    }
+
+    /// Must run off the main actor (both callers detach first).
+    private static func read(store: SessionStore, sessionID: UUID) throws -> StoredSession {
+        try? store.flush() // pick up the last unflushed batch of a live session
+        guard let session = try store.loadSession(sessionID) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        return StoredSession(
+            session: session,
+            samples: try store.samples(for: sessionID),
+            throughput: try store.throughputResults(for: sessionID),
+            diagnostics: try store.diagnostics(for: sessionID),
+            traffic: try store.trafficCaptures(for: sessionID)
+        )
+    }
+
     static func load(store: SessionStore, sessionID: UUID) async throws -> SessionDetail {
         try await Task.detached(priority: .userInitiated) {
-            try? store.flush() // pick up the last unflushed batch of a live session
-
-            guard let session = try store.loadSession(sessionID) else {
-                throw CocoaError(.fileNoSuchFile)
-            }
-            let samples = try store.samples(for: sessionID)
-            let throughput = try store.throughputResults(for: sessionID)
-            let diagnostics = try store.diagnostics(for: sessionID)
-            let traffic = try store.trafficCaptures(for: sessionID)
+            let stored = try Self.read(store: store, sessionID: sessionID)
+            let session = stored.session
+            let samples = stored.samples
+            let throughput = stored.throughput
+            let diagnostics = stored.diagnostics
+            let traffic = stored.traffic
             let wan = try store.wanSnapshots(for: sessionID)
 
             // Everything that judges the session skips the ICMP warm-up
@@ -91,7 +113,7 @@ enum DetailLoader {
             // a warm-up timeout, and "10 slowest" always leads with the
             // warm-up spike. `samples` keeps everything, for export and for
             // the capped table window.
-            let analysed = samples.filter { $0.id >= PingSample.warmupSampleCount }
+            let analysed = samples.filter { !$0.isWarmup }
 
             var builder = LiveSummaryBuilder()
             for sample in analysed { builder.add(sample) }
@@ -123,16 +145,13 @@ enum DetailLoader {
 
     static func export(store: SessionStore, sessionID: UUID) async throws -> SessionExport {
         try await Task.detached(priority: .userInitiated) {
-            try? store.flush()
-            guard let session = try store.loadSession(sessionID) else {
-                throw CocoaError(.fileNoSuchFile)
-            }
+            let stored = try Self.read(store: store, sessionID: sessionID)
             return SessionExport(
-                session: session,
-                samples: try store.samples(for: sessionID),
-                throughput: try store.throughputResults(for: sessionID),
-                diagnostics: try store.diagnostics(for: sessionID),
-                traffic: try store.trafficCaptures(for: sessionID)
+                session: stored.session,
+                samples: stored.samples,
+                throughput: stored.throughput,
+                diagnostics: stored.diagnostics,
+                traffic: stored.traffic
             )
         }.value
     }

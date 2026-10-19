@@ -4,6 +4,7 @@ import NetlogsCore
 enum SidebarItem: Hashable {
     case monitor
     case analysis
+    case router
     case session(UUID)
 }
 
@@ -106,6 +107,8 @@ struct RootView: View {
             AnalysisView(store: store, settings: settings) { id in
                 selection = [.session(id)]
             }
+        } else if selection.contains(.router) {
+            RouterView(store: store)
         } else if sessions.count > 1 {
             multiSelection(sessions)
         } else if let session = sessions.first {
@@ -145,7 +148,8 @@ struct RootView: View {
             controller: controller,
             settings: settings.monitor,
             onSessionEnd: reload,
-            mode: $settings.detailMode
+            mode: $settings.detailMode,
+            usesV2: settings.monitorV2Beta
         )
     }
 

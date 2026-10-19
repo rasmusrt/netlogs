@@ -36,6 +36,19 @@ private final class FakePinger: ICMPPinging, @unchecked Sendable {
     }
 }
 
+/// Every reply takes `delay` to arrive, so a probe can resolve after the
+/// phase it was sent in has ended.
+private final class SlowPinger: ICMPPinging, @unchecked Sendable {
+    let delay: Duration
+    init(delay: Duration) { self.delay = delay }
+    func open() throws {}
+    func close() {}
+    func ping(host: String, sequence: UInt32) async -> PingOutcome {
+        try? await Task.sleep(for: delay)
+        return .reply(rttMs: delay.timeInterval * 1000)
+    }
+}
+
 final class MonitorEngineTests: XCTestCase {
 
     private func makeEngine(_ outcomes: [String: PingOutcome]) -> (MonitorEngine, FakePinger) {
@@ -153,6 +166,51 @@ final class MonitorEngineTests: XCTestCase {
         XCTAssertEqual(samples.map(\.id), Array(0..<UInt32(samples.count)), "cadence unbroken")
         XCTAssertTrue(samples.allSatisfy { $0.routerMs == nil && $0.internetMs == nil })
         XCTAssertGreaterThanOrEqual(opens.get, 2, "pinger rebuilt at least once")
+    }
+
+    /// A sample's phase is the phase the probe was *sent* in (or, if the
+    /// engine came under load while it was in flight, that). It used to be
+    /// the phase at the moment the reply arrived, which tagged every slow
+    /// loaded probe — the ones that resolve after the transfer stops — as
+    /// idle, and counted a timeout caused by the app's own upload as real
+    /// packet loss.
+    func testPhaseIsTaggedWhenTheProbeIsSentNotWhenItReturns() async throws {
+        let engine = MonitorEngine(
+            settings: MonitorSettings(
+                routerHost: "192.168.1.1", internetHost: "1.1.1.1",
+                pingInterval: .milliseconds(50), pingTimeout: .seconds(1)
+            ),
+            pingerFactory: { _, _ in SlowPinger(delay: .milliseconds(300)) },
+            throughputProvider: nil
+        )
+        let collected = Locked<[PingSample]>([])
+        let stream = try await engine.start(warmup: .zero)
+        let collector = Task { for await s in stream { collected.mutate { $0.append(s) } } }
+
+        try await Task.sleep(for: .milliseconds(120))
+        await engine.setPhase(.uploading)
+        let loadBegan = Date()
+        try await Task.sleep(for: .milliseconds(200))
+        await engine.setPhase(.idle)
+        let loadEnded = Date()
+        try await Task.sleep(for: .milliseconds(700)) // let the 300 ms replies land
+        await engine.stop()
+        _ = await collector.value
+
+        let samples = collected.get
+        // Probes scheduled well inside the window resolved after it closed.
+        let inside = samples.filter {
+            $0.timestamp > loadBegan.addingTimeInterval(0.05)
+                && $0.timestamp < loadEnded.addingTimeInterval(-0.05)
+        }
+        XCTAssertFalse(inside.isEmpty, "need probes sent inside the load window")
+        XCTAssertTrue(inside.allSatisfy { $0.phase == .uploading },
+                      "sent under load, so under load: \(inside.map(\.phase))")
+        // Probes scheduled well after it are idle, whenever they resolve.
+        let after = samples.filter { $0.timestamp > loadEnded.addingTimeInterval(0.1) }
+        XCTAssertFalse(after.isEmpty)
+        XCTAssertTrue(after.allSatisfy { $0.phase == .idle },
+                      "sent idle and resolved idle: \(after.map(\.phase))")
     }
 
     func testStopEndsTheStream() async throws {

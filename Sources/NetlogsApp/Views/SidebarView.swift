@@ -10,6 +10,9 @@ struct SidebarView: View {
     /// so this is only used to badge the Monitor row.
     let runningSessionID: UUID?
     var onDelete: ([SessionState]) -> Void = { _ in }
+    /// Optional so the harnesses that render this without the app's scene
+    /// still can.
+    @Environment(Updater.self) private var updater: Updater?
 
     var body: some View {
         List(selection: $selection) {
@@ -33,6 +36,11 @@ struct SidebarView: View {
             // row.
             Label("Analysis", systemImage: "chart.bar.xaxis")
                 .tag(SidebarItem.analysis)
+
+            // The home network over a day: Wi-Fi, router and line on one
+            // time axis, so "which one was it?" is read at a glance.
+            Label("Router", systemImage: "wifi.router")
+                .tag(SidebarItem.router)
 
             Section("Logs") {
                 if sessions.isEmpty {
@@ -60,6 +68,9 @@ struct SidebarView: View {
         // the list has focus; without it a plain list selection reads as a flat
         // grey block that looks disabled.
         .listStyle(.sidebar)
+        .safeAreaInset(edge: .bottom) {
+            if let updater { UpdateNotice(updater: updater) }
+        }
         .navigationTitle("Netlogs")
         // Resizable, because a Mac sidebar is: Finder, Mail and Xcode all let
         // you drag one within a range and remember where you left it. A single

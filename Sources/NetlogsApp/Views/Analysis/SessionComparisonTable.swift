@@ -8,58 +8,74 @@ import NetlogsCore
 /// rows accumulate, and a sortable comparison table is exactly where that
 /// mistake would come back.
 ///
-/// Loss is split three ways — internet, router, both — because the split *is*
-/// the diagnosis. A single loss column would hide the one distinction this app
-/// exists to draw.
+/// Missed pings are split three ways — internet, router, both — because the
+/// split *is* the diagnosis. It sits on a quiet second line under the row,
+/// only where there is something to say, rather than as a column of 0 / 0 / 0.
 struct SessionComparisonTable: View {
     let sessions: [SessionAnalysis]
     var focused: Set<UUID> = []
     var onSelect: ((UUID) -> Void)?
 
-    private static let rowHeight: CGFloat = 26
+    @State private var width: CGFloat = 0
+    @State private var hovered: UUID?
 
     /// One place for the column widths, so a header cannot drift off the values
     /// under it — and one place to total them, which is what the horizontal
     /// scroll needs to know.
     private enum Column {
-        static let started: CGFloat = 116
-        static let ran: CGFloat = 62
-        static let covered: CGFloat = 62
-        static let samples: CGFloat = 66
-        static let p50: CGFloat = 52
-        static let p95: CGFloat = 52
-        static let lost: CGFloat = 48
-        static let missed: CGFloat = 120
-        static let shape: CGFloat = 72
-        static let score: CGFloat = 130
+        static let started: CGFloat = 120
+        static let ran: CGFloat = 64
+        static let typical: CGFloat = 64
+        static let worst: CGFloat = 72
+        static let lost: CGFloat = 44
+        static let shape: CGFloat = 80
+        static let score: CGFloat = 76
 
-        static let all: [CGFloat] = [started, ran, covered, samples, p50, p95,
-                                     lost, missed, shape, score]
-        static var total: CGFloat {
-            all.reduce(0, +) + Space.s * CGFloat(all.count - 1)
+        static let all: [CGFloat] = [started, ran, typical, worst, lost, shape, score]
+        /// Narrow windows keep what the diagnosis reads — when, how slow,
+        /// what was lost, the score — and drop what only qualifies it.
+        static let compact: [CGFloat] = [started, typical, worst, lost, score]
+
+        static func total(_ columns: [CGFloat]) -> CGFloat {
+            columns.reduce(0, +) + Space.m * CGFloat(columns.count - 1) + Space.s * 2
         }
     }
 
     var body: some View {
-        // Horizontal scroll, rather than a wider detail column. Eight columns
-        // need about 730 pt and the window's minimum is 620, so at a narrow
-        // width the Score column was simply clipped off the right edge. Raising
-        // the detail column's own minimum is what `RootView` records as having
-        // made the sidebar jump.
+        // Full table when it fits, the compact one when it does not, and a
+        // horizontal scroll only as the last resort. Every column grows from
+        // its minimum, so a wide card shares its spare width out evenly.
         //
         // No vertical scroll of its own: the screen already scrolls, and
         // nesting one inside the other makes both feel broken.
-        ScrollView(.horizontal) {
-            VStack(alignment: .leading, spacing: Space.s) {
-                header
-                Divider()
-                LazyVStack(spacing: 0) {
-                    ForEach(Array(shown.enumerated()), id: \.element.id) { index, analysis in
-                        row(analysis, striped: index.isMultiple(of: 2))
-                    }
+        Group {
+            if width >= Column.total(Column.all) {
+                table(compact: false)
+            } else if width >= Column.total(Column.compact) {
+                table(compact: true)
+            } else {
+                ScrollView(.horizontal) {
+                    table(compact: true)
+                        .frame(width: Column.total(Column.compact))
                 }
             }
-            .frame(width: Column.total, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
+    }
+
+    private func table(compact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: Space.xs) {
+            header(compact: compact)
+            // Thin rules between rows and a soft highlight under the pointer,
+            // like the cards elsewhere — not zebra stripes, which made the
+            // table the loudest thing on a calm screen.
+            LazyVStack(spacing: 0) {
+                ForEach(shown, id: \.id) { analysis in
+                    Divider().opacity(0.5)
+                    row(analysis, compact: compact)
+                }
+            }
         }
     }
 
@@ -67,60 +83,85 @@ struct SessionComparisonTable: View {
         focused.isEmpty ? sessions : sessions.filter { focused.contains($0.id) }
     }
 
-    private var header: some View {
-        HStack(spacing: Space.s) {
-            cell("Started", width: Column.started, alignment: .leading)
-            cell("Ran", width: Column.ran)
-            cell("Covered", width: Column.covered)
-            cell("Samples", width: Column.samples)
-            cell("p50", width: Column.p50)
-            cell("p95", width: Column.p95)
-            cell("Lost", width: Column.lost)
-            // "Missed", not "Loss". These three are *timeouts* — a probe that
-            // did not answer in time — and after schema 7 that is no longer the
-            // same thing as a dropped packet. The Lost column beside it is the
-            // one that means what the old header claimed.
-            cell("Missed int/rtr/both", width: Column.missed)
-            cell("Shape", width: Column.shape)
-            cell("Score", width: Column.score, alignment: .leading)
+    private func header(compact: Bool) -> some View {
+        HStack(spacing: Space.m) {
+            heading("Started", width: Column.started, alignment: .leading)
+            if !compact {
+                heading("Ran", width: Column.ran)
+            }
+            heading("Typical", width: Column.typical)
+            heading("Worst 5 %", width: Column.worst)
+            heading("Lost", width: Column.lost)
+            if !compact {
+                heading("Shape", width: Column.shape, alignment: .center)
+            }
+            heading("Score", width: Column.score, alignment: .leading)
         }
-        .font(.caption2)
-        .foregroundStyle(.secondary)
+        .padding(.horizontal, Space.s)
     }
 
-    private func row(_ analysis: SessionAnalysis, striped: Bool) -> some View {
-        HStack(spacing: Space.s) {
-            cell(analysis.session.startedAt
-                    .formatted(.dateTime.month().day().hour().minute()),
-                 width: Column.started, alignment: .leading)
-            cell(Fmt.duration(analysis.aggregate.measuredSpan), width: Column.ran)
-            cell(coverage(analysis), width: Column.covered, tint: coverageTint(analysis))
-            cell(analysis.aggregate.totalSamples.formatted(), width: Column.samples)
-            cell(Fmt.msCoarse(analysis.latency.p50), width: Column.p50,
-                 tint: Palette.latency(analysis.latency.p50, on: .internet))
-            cell(Fmt.msCoarse(analysis.latency.p95), width: Column.p95,
-                 tint: Palette.latency(analysis.latency.p95, on: .internet))
-            cell(analysis.aggregate.internetNoRepliesIdle.formatted(), width: Column.lost,
-                 tint: Palette.loss(analysis.internetLossRatio))
-            cell(lossSplit(analysis), width: Column.missed)
-            shapeCell(analysis)
-            scoreCell(analysis)
+    private func row(_ analysis: SessionAnalysis, compact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: Space.m) {
+                cell(analysis.session.startedAt
+                        .formatted(.dateTime.month(.abbreviated).day().hour().minute()),
+                     width: Column.started, alignment: .leading)
+                if !compact {
+                    cell(Fmt.duration(analysis.aggregate.measuredSpan), width: Column.ran,
+                         secondary: true)
+                }
+                cell("\(Fmt.msCoarse(analysis.latency.p50)) ms", width: Column.typical,
+                     tint: Palette.latency(analysis.latency.p50, on: .internet))
+                cell("\(Fmt.msCoarse(analysis.latency.p95)) ms", width: Column.worst,
+                     tint: Palette.latency(analysis.latency.p95, on: .internet))
+                cell(analysis.aggregate.internetNoRepliesIdle.formatted(), width: Column.lost,
+                     tint: Palette.loss(analysis.internetLossRatio))
+                if !compact {
+                    shapeCell(analysis)
+                }
+                scoreCell(analysis)
+            }
+            if let note = note(analysis) {
+                Text(note)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
         }
-        .frame(height: Self.rowHeight)
-        .background(striped ? Palette.rowStripe : AnyShapeStyle(.clear))
+        .padding(.horizontal, Space.s)
+        .padding(.vertical, Space.s)
+        .background(hovered == analysis.id ? AnyShapeStyle(.quinary) : AnyShapeStyle(.clear),
+                    in: RoundedRectangle(cornerRadius: Radius.control, style: .continuous))
         .contentShape(Rectangle())
+        .onHover { inside in
+            if inside { hovered = analysis.id } else if hovered == analysis.id { hovered = nil }
+        }
         .onTapGesture { onSelect?(analysis.id) }
     }
 
-    /// The sparkline, moved here from the sidebar row.
+    /// What a row needs said that has no column of its own: where pings went
+    /// unanswered, and a session that measured too little of its time.
     ///
-    /// This is where it was always going to end up. A list answers "which of
-    /// these should I open", which a dot does better; a comparison table
-    /// answers "how did these differ", which is exactly what a shape is for —
-    /// and this screen has the width to draw one at a size worth reading.
-    ///
-    /// Blank where the summary has not been written yet, rather than a zero
-    /// line: an unsummarised session is unknown, not flat.
+    /// "Missed", not "lost": these are *timeouts* — a probe that did not answer
+    /// in time — and the split is the diagnosis: internet, router, or both.
+    private func note(_ analysis: SessionAnalysis) -> String? {
+        var parts: [String] = []
+        let missed = [(analysis.internetOnlyTimeouts, "internet"),
+                      (analysis.routerOnlyTimeouts, "router"),
+                      (analysis.aggregate.bothTimeouts, "both")]
+            .filter { $0.0 > 0 }
+            .map { "\($0.0) \($0.1)" }
+        if !missed.isEmpty { parts.append("Missed: " + missed.joined(separator: " · ")) }
+        // A session that measured 19 % of what it claims is not a short
+        // session; it is one with a hole in it.
+        if analysis.coverage < Scoring.coverageFloor {
+            parts.append("Measured \(Fmt.percent(analysis.coverage)) of the time")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "   ")
+    }
+
+    /// The sparkline: did this session change while it ran. Blank where the
+    /// summary has not been written yet — unknown, not flat.
     @ViewBuilder
     private func shapeCell(_ analysis: SessionAnalysis) -> some View {
         if let spark = analysis.session.summary?.spark {
@@ -128,62 +169,51 @@ struct SessionComparisonTable: View {
                           tint: analysis.session.summary.flatMap {
                               Palette.latency($0.p95Ms, on: .internet)
                           })
-                .frame(width: Column.shape)
+                .frame(minWidth: Column.shape, maxWidth: .infinity)
         } else {
-            Color.clear.frame(width: Column.shape, height: 1)
+            Color.clear.frame(minWidth: Column.shape, maxWidth: .infinity, maxHeight: 1)
         }
-    }
-
-    /// Three counts in one column, in the order the diagnosis reads them.
-    private func lossSplit(_ analysis: SessionAnalysis) -> String {
-        "\(analysis.internetOnlyTimeouts) / \(analysis.routerOnlyTimeouts) / "
-            + "\(analysis.aggregate.bothTimeouts)"
-    }
-
-    private func coverage(_ analysis: SessionAnalysis) -> String {
-        Fmt.percent(analysis.coverage)
-    }
-
-    /// A session that measured 19% of what it claims is not a short session —
-    /// it is a session with a hole in it, and ranking it beside the others
-    /// without saying so would be the omission the coverage column exists for.
-    private func coverageTint(_ analysis: SessionAnalysis) -> Color? {
-        analysis.coverage < Scoring.coverageFloor ? Palette.bad : nil
     }
 
     @ViewBuilder
     private func scoreCell(_ analysis: SessionAnalysis) -> some View {
-        switch analysis.score {
-        case .scored(let score):
-            HStack(spacing: Space.xs) {
+        Group {
+            switch analysis.score {
+            case .scored(let score):
+                let tint = AnalysisFigures.scoreTint(score.value)
                 Text("\(score.value)")
-                    .font(.tabularSmall)
-                    .foregroundStyle(Palette.score(score) ?? .primary)
-                Text(score.constraint.map { $0.kind.rawValue } ?? "—")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                if !score.isComplete {
-                    Text("(\(score.components.count)/4)")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
+                    .font(.caption.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(tint)
+                    .padding(.horizontal, Space.s)
+                    .padding(.vertical, 1)
+                    .background(Palette.fill(tint), in: Capsule())
+            case .withheld:
+                Text("Too short")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
             }
-            .frame(width: Column.score, alignment: .leading)
-        case .withheld:
-            Text("withheld")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .frame(width: Column.score, alignment: .leading)
         }
+        .frame(minWidth: Column.score, maxWidth: .infinity, alignment: .leading)
     }
 
-    private func cell(_ text: String, width: CGFloat,
-                      alignment: Alignment = .trailing, tint: Color? = nil) -> some View {
-        Text(text)
-            .font(.tabularSmall)
-            .foregroundStyle(tint ?? .primary)
+    private func heading(_ text: String, width: CGFloat,
+                         alignment: Alignment = .trailing) -> some View {
+        Text(text.uppercased())
+            .font(.caption2.weight(.semibold))
+            .tracking(0.6)
+            .foregroundStyle(.secondary)
             .lineLimit(1)
-            .frame(width: width, alignment: alignment)
+            .frame(minWidth: width, maxWidth: .infinity, alignment: alignment)
+    }
+
+    private func cell(_ text: String, width: CGFloat, alignment: Alignment = .trailing,
+                      tint: Color? = nil, secondary: Bool = false) -> some View {
+        Text(text)
+            .font(.callout.monospacedDigit())
+            .foregroundStyle(tint.map { AnyShapeStyle($0.opacity(0.9)) }
+                             ?? (secondary ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary)))
+            .lineLimit(1)
+            .frame(minWidth: width, maxWidth: .infinity, alignment: alignment)
     }
 }
 

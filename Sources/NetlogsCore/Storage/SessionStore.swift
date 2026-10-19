@@ -158,18 +158,7 @@ public final class SessionStore: @unchecked Sendable {
     /// Store one diagnostics snapshot (JSON blob). Called only when the change
     /// detector says so, so this writes straight through — no batching needed.
     public func appendDiagnostics(_ snapshot: DiagnosticsSnapshot, to sessionID: UUID) throws {
-        try queue.sync {
-            let json = try JSONEncoder().encode(snapshot)
-            let stmt = try prepare("""
-                INSERT OR REPLACE INTO diagnostics_snapshots (session_id, timestamp, json)
-                VALUES (?, ?, ?);
-                """)
-            defer { sqlite3_finalize(stmt) }
-            bind(stmt, 1, sessionID.uuidString)
-            bind(stmt, 2, snapshot.timestamp.timeIntervalSince1970)
-            bind(stmt, 3, String(decoding: json, as: UTF8.self))
-            try step(stmt)
-        }
+        try appendJSON(snapshot, at: snapshot.timestamp, to: .diagnostics, sessionID: sessionID)
     }
 
     // MARK: - Traffic captures
@@ -178,39 +167,12 @@ public final class SessionStore: @unchecked Sendable {
     /// pattern as diagnostics: they are rare by construction — one per latency
     /// episode, floored at one per ten minutes — so there is nothing to batch.
     public func appendTrafficCapture(_ capture: TrafficCapture, to sessionID: UUID) throws {
-        try queue.sync {
-            let json = try JSONEncoder().encode(capture)
-            let stmt = try prepare("""
-                INSERT OR REPLACE INTO traffic_captures (session_id, timestamp, json)
-                VALUES (?, ?, ?);
-                """)
-            defer { sqlite3_finalize(stmt) }
-            bind(stmt, 1, sessionID.uuidString)
-            bind(stmt, 2, capture.timestamp.timeIntervalSince1970)
-            bind(stmt, 3, String(decoding: json, as: UTF8.self))
-            try step(stmt)
-        }
+        try appendJSON(capture, at: capture.timestamp, to: .trafficCaptures, sessionID: sessionID)
     }
 
     /// Stored traffic captures for a session, oldest first.
     public func trafficCaptures(for id: UUID) throws -> [TrafficCapture] {
-        try queue.sync {
-            let stmt = try prepare("""
-                SELECT json FROM traffic_captures WHERE session_id = ? ORDER BY timestamp;
-                """)
-            defer { sqlite3_finalize(stmt) }
-            bind(stmt, 1, id.uuidString)
-            let decoder = JSONDecoder()
-            var out: [TrafficCapture] = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                guard let cString = sqlite3_column_text(stmt, 0) else { continue }
-                let data = Data(String(cString: cString).utf8)
-                if let capture = try? decoder.decode(TrafficCapture.self, from: data) {
-                    out.append(capture)
-                }
-            }
-            return out
-        }
+        try readJSON(TrafficCapture.self, from: .trafficCaptures, for: [id])[id] ?? []
     }
 
     // MARK: - Gateway telemetry
@@ -218,35 +180,68 @@ public final class SessionStore: @unchecked Sendable {
     /// Store one gateway poll. Straight through, like diagnostics: the change
     /// detector holds this to about one row per 5 s.
     public func appendWANSnapshot(_ snapshot: WANSnapshot, to sessionID: UUID) throws {
+        try appendJSON(snapshot, at: snapshot.timestamp, to: .wanSnapshots, sessionID: sessionID)
+    }
+
+    /// Stored gateway polls for a session, oldest first.
+    public func wanSnapshots(for id: UUID) throws -> [WANSnapshot] {
+        try readJSON(WANSnapshot.self, from: .wanSnapshots, for: [id])[id] ?? []
+    }
+
+    // MARK: - JSON-blob tables (shared by the three above)
+
+    /// The three tables that store one `Codable` value per row as a JSON
+    /// blob. They share a shape — `(session_id, timestamp, json)` — and used
+    /// to share three copies of the same INSERT and SELECT; this is the one
+    /// copy.
+    private enum JSONTable: String {
+        case diagnostics = "diagnostics_snapshots"
+        case trafficCaptures = "traffic_captures"
+        case wanSnapshots = "wan_snapshots"
+    }
+
+    /// Straight-through insert: every caller is rate-limited upstream (a
+    /// change detector or a per-episode floor), so there is nothing to batch.
+    private func appendJSON<T: Encodable>(
+        _ value: T, at timestamp: Date, to table: JSONTable, sessionID: UUID
+    ) throws {
         try queue.sync {
-            let json = try JSONEncoder().encode(snapshot)
+            let json = try JSONEncoder().encode(value)
             let stmt = try prepare("""
-                INSERT OR REPLACE INTO wan_snapshots (session_id, timestamp, json)
+                INSERT OR REPLACE INTO \(table.rawValue) (session_id, timestamp, json)
                 VALUES (?, ?, ?);
                 """)
             defer { sqlite3_finalize(stmt) }
             bind(stmt, 1, sessionID.uuidString)
-            bind(stmt, 2, snapshot.timestamp.timeIntervalSince1970)
+            bind(stmt, 2, timestamp.timeIntervalSince1970)
             bind(stmt, 3, String(decoding: json, as: UTF8.self))
             try step(stmt)
         }
     }
 
-    /// Stored gateway polls for a session, oldest first.
-    public func wanSnapshots(for id: UUID) throws -> [WANSnapshot] {
-        try queue.sync {
+    /// Rows for several sessions in one query, each session's oldest first.
+    /// A row that no longer decodes is skipped, as before — a stale blob
+    /// must not hide the rest of the session.
+    private func readJSON<T: Decodable>(
+        _ type: T.Type, from table: JSONTable, for ids: [UUID]
+    ) throws -> [UUID: [T]] {
+        guard !ids.isEmpty else { return [:] }
+        return try queue.sync {
             let stmt = try prepare("""
-                SELECT json FROM wan_snapshots WHERE session_id = ? ORDER BY timestamp;
+                SELECT session_id, json FROM \(table.rawValue)
+                WHERE session_id IN (\(placeholders(ids.count)))
+                ORDER BY session_id, timestamp;
                 """)
             defer { sqlite3_finalize(stmt) }
-            bind(stmt, 1, id.uuidString)
+            bindIDs(stmt, ids)
             let decoder = JSONDecoder()
-            var out: [WANSnapshot] = []
+            var out: [UUID: [T]] = [:]
             while sqlite3_step(stmt) == SQLITE_ROW {
-                guard let cString = sqlite3_column_text(stmt, 0) else { continue }
+                guard let id = UUID(uuidString: text(stmt, 0)),
+                      let cString = sqlite3_column_text(stmt, 1) else { continue }
                 let data = Data(String(cString: cString).utf8)
-                if let snapshot = try? decoder.decode(WANSnapshot.self, from: data) {
-                    out.append(snapshot)
+                if let value = try? decoder.decode(T.self, from: data) {
+                    out[id, default: []].append(value)
                 }
             }
             return out
@@ -300,18 +295,19 @@ public final class SessionStore: @unchecked Sendable {
     }
 
     public func throughputCount(for id: UUID) throws -> Int {
-        try queue.sync {
-            let stmt = try prepare("SELECT COUNT(*) FROM throughput_results WHERE session_id = ?;")
-            defer { sqlite3_finalize(stmt) }
-            bind(stmt, 1, id.uuidString)
-            guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
-            return Int(sqlite3_column_int64(stmt, 0))
-        }
+        try rowCount(in: "throughput_results", for: id)
     }
 
     /// Throughput results for a session, oldest first.
     public func throughputResults(for id: UUID) throws -> [ThroughputResult] {
-        try queue.sync {
+        try throughputResults(for: [id])[id] ?? []
+    }
+
+    /// Throughput results for several sessions in one query, keyed by
+    /// session and oldest first within each.
+    public func throughputResults(for ids: [UUID]) throws -> [UUID: [ThroughputResult]] {
+        guard !ids.isEmpty else { return [:] }
+        return try queue.sync {
             let stmt = try prepare("""
                 SELECT id, timestamp, download_mbps, upload_mbps, bytes_down, bytes_up,
                        idle_latency_ms, download_latency_ms, upload_latency_ms,
@@ -319,14 +315,17 @@ public final class SessionStore: @unchecked Sendable {
                        idle_low_ms, idle_high_ms,
                        download_jitter_ms, download_low_ms, download_high_ms,
                        upload_jitter_ms, upload_low_ms, upload_high_ms,
-                       isp, server_location
-                FROM throughput_results WHERE session_id = ? ORDER BY timestamp;
+                       isp, server_location, session_id
+                FROM throughput_results
+                WHERE session_id IN (\(placeholders(ids.count)))
+                ORDER BY session_id, timestamp;
                 """)
             defer { sqlite3_finalize(stmt) }
-            bind(stmt, 1, id.uuidString)
-            var out: [ThroughputResult] = []
+            bindIDs(stmt, ids)
+            var out: [UUID: [ThroughputResult]] = [:]
             while sqlite3_step(stmt) == SQLITE_ROW {
-                out.append(ThroughputResult(
+                guard let sessionID = UUID(uuidString: text(stmt, 21)) else { continue }
+                out[sessionID, default: []].append(ThroughputResult(
                     id: UUID(uuidString: text(stmt, 0)) ?? UUID(),
                     timestamp: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 1)),
                     downloadMbps: sqlite3_column_double(stmt, 2),
@@ -349,8 +348,8 @@ public final class SessionStore: @unchecked Sendable {
                     uploadJitterMs: optionalDouble(stmt, 16),
                     uploadLowMs: optionalDouble(stmt, 17),
                     uploadHighMs: optionalDouble(stmt, 18),
-                    isp: sqlite3_column_type(stmt, 19) == SQLITE_NULL ? nil : text(stmt, 19),
-                    serverLocation: sqlite3_column_type(stmt, 20) == SQLITE_NULL ? nil : text(stmt, 20)
+                    isp: optionalText(stmt, 19),
+                    serverLocation: optionalText(stmt, 20)
                 ))
             }
             return out
@@ -358,34 +357,19 @@ public final class SessionStore: @unchecked Sendable {
     }
 
     public func diagnosticsCount(for id: UUID) throws -> Int {
-        try queue.sync {
-            let stmt = try prepare("SELECT COUNT(*) FROM diagnostics_snapshots WHERE session_id = ?;")
-            defer { sqlite3_finalize(stmt) }
-            bind(stmt, 1, id.uuidString)
-            guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
-            return Int(sqlite3_column_int64(stmt, 0))
-        }
+        try rowCount(in: "diagnostics_snapshots", for: id)
     }
 
     /// Stored diagnostics snapshots for a session, oldest first.
     public func diagnostics(for id: UUID) throws -> [DiagnosticsSnapshot] {
-        try queue.sync {
-            let stmt = try prepare("""
-                SELECT json FROM diagnostics_snapshots WHERE session_id = ? ORDER BY timestamp;
-                """)
-            defer { sqlite3_finalize(stmt) }
-            bind(stmt, 1, id.uuidString)
-            let decoder = JSONDecoder()
-            var out: [DiagnosticsSnapshot] = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                guard let cString = sqlite3_column_text(stmt, 0) else { continue }
-                let data = Data(String(cString: cString).utf8)
-                if let snap = try? decoder.decode(DiagnosticsSnapshot.self, from: data) {
-                    out.append(snap)
-                }
-            }
-            return out
-        }
+        try diagnostics(for: [id])[id] ?? []
+    }
+
+    /// Diagnostics for several sessions in one query, keyed by session. The
+    /// Analysis screen reads every session in a range; one round trip per
+    /// session added up.
+    public func diagnostics(for ids: [UUID]) throws -> [UUID: [DiagnosticsSnapshot]] {
+        try readJSON(DiagnosticsSnapshot.self, from: .diagnostics, for: ids)
     }
 
     // MARK: - Delete / prune / size (plan §7 / §13 Q3)
@@ -476,13 +460,7 @@ public final class SessionStore: @unchecked Sendable {
     /// All sessions, newest first.
     public func allSessions() throws -> [SessionState] {
         try queue.sync {
-            let stmt = try prepare("SELECT id FROM sessions ORDER BY started_at DESC;")
-            defer { sqlite3_finalize(stmt) }
-            var ids: [UUID] = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                if let u = UUID(uuidString: text(stmt, 0)) { ids.append(u) }
-            }
-            return try ids.compactMap { try loadSessionLocked($0) }
+            try loadSessionsLocked(where: "1", orderBy: "started_at DESC") { _ in }
         }
     }
 
@@ -501,25 +479,20 @@ public final class SessionStore: @unchecked Sendable {
     /// a night while labelled with the session.
     public func sessionsOverlapping(_ range: ClosedRange<Date>) throws -> [SessionState] {
         try queue.sync {
-            let stmt = try prepare("""
-                SELECT s.id FROM sessions s
-                WHERE s.started_at <= ?
-                  AND COALESCE(
-                        s.stopped_at,
-                        (SELECT MAX(p.timestamp) FROM ping_samples p WHERE p.session_id = s.id),
-                        s.started_at
-                      ) >= ?
-                ORDER BY s.started_at DESC;
-                """)
-            defer { sqlite3_finalize(stmt) }
-            bind(stmt, 1, range.upperBound.timeIntervalSince1970)
-            bind(stmt, 2, range.lowerBound.timeIntervalSince1970)
-
-            var ids: [UUID] = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                if let u = UUID(uuidString: text(stmt, 0)) { ids.append(u) }
+            try loadSessionsLocked(
+                where: """
+                    s.started_at <= ?
+                    AND COALESCE(
+                          s.stopped_at,
+                          (SELECT MAX(p.timestamp) FROM ping_samples p WHERE p.session_id = s.id),
+                          s.started_at
+                        ) >= ?
+                    """,
+                orderBy: "s.started_at DESC"
+            ) { stmt in
+                bind(stmt, 1, range.upperBound.timeIntervalSince1970)
+                bind(stmt, 2, range.lowerBound.timeIntervalSince1970)
             }
-            return try ids.compactMap { try loadSessionLocked($0) }
         }
     }
 
@@ -543,7 +516,7 @@ public final class SessionStore: @unchecked Sendable {
     ) throws -> [UUID: PingAggregate] {
         guard !ids.isEmpty else { return [:] }
         return try queue.sync {
-            let slots = Array(repeating: "?", count: ids.count).joined(separator: ",")
+            let slots = placeholders(ids.count)
             let stmt = try prepare("""
                 WITH windowed AS (
                     SELECT session_id, timestamp, router_ms, internet_ms,
@@ -591,23 +564,15 @@ public final class SessionStore: @unchecked Sendable {
                 FROM windowed GROUP BY session_id;
                 """)
             defer { sqlite3_finalize(stmt) }
-            for (offset, id) in ids.enumerated() {
-                bind(stmt, Int32(offset + 1), id.uuidString)
-            }
+            bindIDs(stmt, ids)
             bind(stmt, Int32(ids.count + 1),
                  Int64(skippingWarmup ? PingSample.warmupSampleCount : 0))
 
             var out: [UUID: PingAggregate] = [:]
             while sqlite3_step(stmt) == SQLITE_ROW {
                 guard let id = UUID(uuidString: text(stmt, 0)) else { continue }
-                func date(_ index: Int32) -> Date? {
-                    sqlite3_column_type(stmt, index) == SQLITE_NULL
-                        ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, index))
-                }
-                func optional(_ index: Int32) -> Double? {
-                    sqlite3_column_type(stmt, index) == SQLITE_NULL
-                        ? nil : sqlite3_column_double(stmt, index)
-                }
+                func date(_ index: Int32) -> Date? { optionalDate(stmt, index) }
+                func optional(_ index: Int32) -> Double? { optionalDouble(stmt, index) }
                 func count(_ index: Int32) -> Int { Int(sqlite3_column_int64(stmt, index)) }
 
                 out[id] = PingAggregate(
@@ -649,7 +614,7 @@ public final class SessionStore: @unchecked Sendable {
     ) throws -> [UUID: LatencyHistogram] {
         guard !ids.isEmpty else { return [:] }
         return try queue.sync {
-            let slots = Array(repeating: "?", count: ids.count).joined(separator: ",")
+            let slots = placeholders(ids.count)
             let stmt = try prepare("""
                 SELECT session_id, CAST(\(host.column) AS INTEGER) AS bucket, COUNT(*)
                 FROM ping_samples
@@ -657,9 +622,7 @@ public final class SessionStore: @unchecked Sendable {
                 GROUP BY session_id, bucket;
                 """)
             defer { sqlite3_finalize(stmt) }
-            for (offset, id) in ids.enumerated() {
-                bind(stmt, Int32(offset + 1), id.uuidString)
-            }
+            bindIDs(stmt, ids)
             bind(stmt, Int32(ids.count + 1),
                  Int64(skippingWarmup ? PingSample.warmupSampleCount : 0))
 
@@ -695,7 +658,7 @@ public final class SessionStore: @unchecked Sendable {
     ) throws -> [HourlyBucket] {
         guard !ids.isEmpty else { return [] }
         return try queue.sync {
-            let slots = Array(repeating: "?", count: ids.count).joined(separator: ",")
+            let slots = placeholders(ids.count)
             let stmt = try prepare("""
                 SELECT session_id,
                        strftime('%Y-%m-%d', timestamp, 'unixepoch', 'localtime') AS day,
@@ -708,9 +671,7 @@ public final class SessionStore: @unchecked Sendable {
                 GROUP BY session_id, day, hour, bucket;
                 """)
             defer { sqlite3_finalize(stmt) }
-            for (offset, id) in ids.enumerated() {
-                bind(stmt, Int32(offset + 1), id.uuidString)
-            }
+            bindIDs(stmt, ids)
             bind(stmt, Int32(ids.count + 1),
                  Int64(skippingWarmup ? PingSample.warmupSampleCount : 0))
 
@@ -730,9 +691,71 @@ public final class SessionStore: @unchecked Sendable {
         }
     }
 
+    /// Loss and internet jitter per session, per calendar day, per hour of
+    /// day — what `hourlyBuckets` is for latency, for the Analysis chart's
+    /// loss and jitter bars.
+    ///
+    /// Jitter is paired exactly as in `pingAggregates`: `LAG` over the
+    /// session after the warm-up filter, so a pair can span a hole in the
+    /// sequence. Only idle samples are counted, as in `hourlyBuckets`, so the
+    /// app's own speed tests do not paint an hour lossy or jittery.
+    public func hourlyPingStats(
+        for ids: [UUID], skippingWarmup: Bool = true
+    ) throws -> [HourlyPingStats] {
+        guard !ids.isEmpty else { return [] }
+        return try queue.sync {
+            let slots = placeholders(ids.count)
+            let stmt = try prepare("""
+                WITH windowed AS (
+                    SELECT session_id, timestamp, phase, router_ms, internet_ms,
+                           router_late_ms,
+                           LAG(internet_ms) OVER w AS prev_internet
+                    FROM ping_samples
+                    WHERE session_id IN (\(slots)) AND seq >= ?
+                    WINDOW w AS (PARTITION BY session_id ORDER BY seq)
+                )
+                SELECT session_id,
+                       strftime('%Y-%m-%d', timestamp, 'unixepoch', 'localtime') AS day,
+                       CAST(strftime('%H', timestamp, 'unixepoch', 'localtime') AS INTEGER) AS hour,
+                       COUNT(*),
+                       SUM(router_ms IS NULL AND router_late_ms IS NULL),
+                       SUM(internet_ms IS NULL AND router_ms IS NOT NULL),
+                       COALESCE(SUM(CASE WHEN internet_ms IS NOT NULL AND prev_internet IS NOT NULL
+                                         THEN ABS(internet_ms - prev_internet) END), 0),
+                       SUM(CASE WHEN internet_ms IS NOT NULL AND prev_internet IS NOT NULL
+                                THEN 1 ELSE 0 END)
+                FROM windowed
+                WHERE phase = 'idle'
+                GROUP BY session_id, day, hour;
+                """)
+            defer { sqlite3_finalize(stmt) }
+            bindIDs(stmt, ids)
+            bind(stmt, Int32(ids.count + 1),
+                 Int64(skippingWarmup ? PingSample.warmupSampleCount : 0))
+
+            var out: [HourlyPingStats] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let id = UUID(uuidString: text(stmt, 0)) else { continue }
+                func count(_ index: Int32) -> Int { Int(sqlite3_column_int64(stmt, index)) }
+                out.append(HourlyPingStats(
+                    key: HourKey(sessionID: id, day: text(stmt, 1), hour: count(2)),
+                    samples: count(3), routerLost: count(4), internetOnlyLost: count(5),
+                    jitterSum: sqlite3_column_double(stmt, 6), jitterPairs: count(7)
+                ))
+            }
+            return out
+        }
+    }
+
     public func sampleCount(for id: UUID) throws -> Int {
+        try rowCount(in: "ping_samples", for: id)
+    }
+
+    /// `SELECT COUNT(*)` for one session in `table`. `table` is always a
+    /// literal from this file, never user input.
+    private func rowCount(in table: String, for id: UUID) throws -> Int {
         try queue.sync {
-            let stmt = try prepare("SELECT COUNT(*) FROM ping_samples WHERE session_id = ?;")
+            let stmt = try prepare("SELECT COUNT(*) FROM \(table) WHERE session_id = ?;")
             defer { sqlite3_finalize(stmt) }
             bind(stmt, 1, id.uuidString)
             guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
@@ -761,18 +784,14 @@ public final class SessionStore: @unchecked Sendable {
 
             var out: [PingSample] = []
             while sqlite3_step(stmt) == SQLITE_ROW {
-                func optional(_ index: Int32) -> Double? {
-                    sqlite3_column_type(stmt, index) == SQLITE_NULL
-                        ? nil : sqlite3_column_double(stmt, index)
-                }
                 out.append(PingSample(
                     id: UInt32(truncatingIfNeeded: sqlite3_column_int64(stmt, 0)),
                     timestamp: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 1)),
-                    routerMs: optional(2),
-                    internetMs: optional(3),
-                    routerLateMs: optional(4),
-                    internetLateMs: optional(5),
-                    phase: LoadPhase(rawValue: text(stmt, 6)) ?? .idle
+                    routerMs: optionalDouble(stmt, 2),
+                    internetMs: optionalDouble(stmt, 3),
+                    routerLateMs: optionalDouble(stmt, 4),
+                    internetLateMs: optionalDouble(stmt, 5),
+                    phase: phase(stmt, 6)
                 ))
             }
             return out
@@ -788,10 +807,18 @@ public final class SessionStore: @unchecked Sendable {
 
         try exec("BEGIN IMMEDIATE;")
         do {
+            // A batch is almost always one session's samples, so the UUID is
+            // formatted once per run of equal ids rather than once per row.
+            var lastSessionID: UUID?
+            var lastSessionString = ""
             for (sessionID, s) in batch {
+                if sessionID != lastSessionID {
+                    lastSessionID = sessionID
+                    lastSessionString = sessionID.uuidString
+                }
                 sqlite3_reset(insertSample)
                 sqlite3_clear_bindings(insertSample)
-                bind(insertSample, 1, sessionID.uuidString)
+                bind(insertSample, 1, lastSessionString)
                 bind(insertSample, 2, Int64(s.id))
                 bind(insertSample, 3, s.timestamp.timeIntervalSince1970)
                 bindOptional(insertSample, 4, s.routerMs)
@@ -810,37 +837,61 @@ public final class SessionStore: @unchecked Sendable {
     }
 
     private func loadSessionLocked(_ id: UUID) throws -> SessionState? {
+        try loadSessionsLocked(where: "s.id = ?", orderBy: "s.started_at") { stmt in
+            bind(stmt, 1, id.uuidString)
+        }.first
+    }
+
+    /// The one SELECT behind `loadSession`, `allSessions` and
+    /// `sessionsOverlapping`. The newest sample's timestamp rides along as a
+    /// correlated subquery (`last_sample_at`), so a list of
+    /// N sessions is one query rather than 2N+1 — it used to be one SELECT
+    /// for the ids, then one row read and one `MAX(timestamp)` per session.
+    ///
+    /// `where` and `orderBy` are literals from this file, never user input.
+    private func loadSessionsLocked(
+        where predicate: String, orderBy: String,
+        bindings: (OpaquePointer) -> Void
+    ) throws -> [SessionState] {
         let stmt = try prepare("""
-            SELECT started_at, stopped_at, router_host, internet_host,
-                   ping_interval_ns, ping_timeout_ns, throughput_enabled,
-                   throughput_interval, diagnostics_interval_ns,
-                   internet_samples, internet_failures, internet_min_ms,
-                   internet_avg_ms, internet_max_ms, internet_p95_ms,
-                   internet_spark,
-                   internet_lost, internet_late, failures_under_load
-            FROM sessions WHERE id = ?;
+            SELECT s.id, s.started_at, s.stopped_at, s.router_host, s.internet_host,
+                   s.ping_interval_ns, s.ping_timeout_ns, s.throughput_enabled,
+                   s.throughput_interval, s.diagnostics_interval_ns,
+                   s.internet_samples, s.internet_failures, s.internet_min_ms,
+                   s.internet_avg_ms, s.internet_max_ms, s.internet_p95_ms,
+                   s.internet_spark,
+                   s.internet_lost, s.internet_late, s.failures_under_load,
+                   (SELECT MAX(p.timestamp) FROM ping_samples p
+                     WHERE p.session_id = s.id) AS last_sample_at
+            FROM sessions s
+            WHERE \(predicate)
+            ORDER BY \(orderBy);
             """)
         defer { sqlite3_finalize(stmt) }
-        bind(stmt, 1, id.uuidString)
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        bindings(stmt)
 
-        let started = Date(timeIntervalSince1970: sqlite3_column_double(stmt, 0))
-        let stopped = sqlite3_column_type(stmt, 1) == SQLITE_NULL
-            ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, 1))
-        let settings = MonitorSettings(
-            routerHost: text(stmt, 2),
-            internetHost: text(stmt, 3),
-            pingInterval: .nanoseconds(sqlite3_column_int64(stmt, 4)),
-            pingTimeout: .nanoseconds(sqlite3_column_int64(stmt, 5)),
-            throughputEnabled: sqlite3_column_int64(stmt, 6) != 0,
-            throughputInterval: Int(sqlite3_column_int64(stmt, 7)),
-            diagnosticsInterval: .nanoseconds(sqlite3_column_int64(stmt, 8))
-        )
-        return SessionState(
-            id: id, startedAt: started, stoppedAt: stopped, settings: settings,
-            lastSampleAt: lastSampleAtLocked(id),
-            summary: summary(from: stmt, firstColumn: 9)
-        )
+        var out: [SessionState] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let id = UUID(uuidString: text(stmt, 0)) else { continue }
+            let settings = MonitorSettings(
+                routerHost: text(stmt, 3),
+                internetHost: text(stmt, 4),
+                pingInterval: .nanoseconds(sqlite3_column_int64(stmt, 5)),
+                pingTimeout: .nanoseconds(sqlite3_column_int64(stmt, 6)),
+                throughputEnabled: sqlite3_column_int64(stmt, 7) != 0,
+                throughputInterval: Int(sqlite3_column_int64(stmt, 8)),
+                diagnosticsInterval: .nanoseconds(sqlite3_column_int64(stmt, 9))
+            )
+            out.append(SessionState(
+                id: id,
+                startedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 1)),
+                stoppedAt: optionalDate(stmt, 2),
+                settings: settings,
+                lastSampleAt: optionalDate(stmt, 20),
+                summary: summary(from: stmt, firstColumn: 10)
+            ))
+        }
+        return out
     }
 
     /// `nil` when this row has never been summarised — the sample count is the
@@ -857,35 +908,18 @@ public final class SessionStore: @unchecked Sendable {
         // Columns 7…9 are schema 8. A row summarised before it has them NULL
         // until `backfillSummaries` reaches it; `lost: nil` then falls back to
         // the timeout count, which over-reports rather than reporting none.
-        func optionalCount(_ index: Int32) -> Int? {
-            sqlite3_column_type(stmt, index) == SQLITE_NULL
-                ? nil : Int(sqlite3_column_int64(stmt, index))
-        }
         return SessionSummary(
             samples: Int(sqlite3_column_int64(stmt, firstColumn)),
             failures: Int(sqlite3_column_int64(stmt, firstColumn + 1)),
-            lost: optionalCount(firstColumn + 7),
-            late: optionalCount(firstColumn + 8) ?? 0,
-            underLoad: optionalCount(firstColumn + 9) ?? 0,
+            lost: optionalCount(stmt, firstColumn + 7),
+            late: optionalCount(stmt, firstColumn + 8) ?? 0,
+            underLoad: optionalCount(stmt, firstColumn + 9) ?? 0,
             minMs: sqlite3_column_double(stmt, firstColumn + 2),
             avgMs: sqlite3_column_double(stmt, firstColumn + 3),
             maxMs: sqlite3_column_double(stmt, firstColumn + 4),
             p95Ms: sqlite3_column_double(stmt, firstColumn + 5),
             spark: spark
         )
-    }
-
-    /// Newest stored sample for a session, so `SessionState.duration` can be
-    /// truthful about one that was never cleanly stopped.
-    private func lastSampleAtLocked(_ id: UUID) -> Date? {
-        guard let stmt = try? prepare(
-            "SELECT MAX(timestamp) FROM ping_samples WHERE session_id = ?;"
-        ) else { return nil }
-        defer { sqlite3_finalize(stmt) }
-        bind(stmt, 1, id.uuidString)
-        guard sqlite3_step(stmt) == SQLITE_ROW,
-              sqlite3_column_type(stmt, 0) != SQLITE_NULL else { return nil }
-        return Date(timeIntervalSince1970: sqlite3_column_double(stmt, 0))
     }
 
     // MARK: - The session summary
@@ -1215,13 +1249,62 @@ public final class SessionStore: @unchecked Sendable {
         if let value { sqlite3_bind_double(stmt, index, value) }
         else { sqlite3_bind_null(stmt, index) }
     }
-    /// `nil` for a NULL column. Ten of these in one row is enough to want a
-    /// name for it.
+    /// `"?,?,?"` for an `IN (…)` list of `count` ids.
+    private func placeholders(_ count: Int) -> String {
+        Array(repeating: "?", count: count).joined(separator: ",")
+    }
+    /// Binds `ids` to parameters 1…n, matching `placeholders(ids.count)`.
+    private func bindIDs(_ stmt: OpaquePointer, _ ids: [UUID]) {
+        for (offset, id) in ids.enumerated() {
+            bind(stmt, Int32(offset + 1), id.uuidString)
+        }
+    }
+
+    // Column readers. Each returns `nil` for a NULL column, because SQLite
+    // reads a NULL REAL/INTEGER back as 0, which would turn "unmeasured"
+    // into "measured zero" on the way out of the database.
+    private func isNull(_ stmt: OpaquePointer, _ index: Int32) -> Bool {
+        sqlite3_column_type(stmt, index) == SQLITE_NULL
+    }
     private func optionalDouble(_ stmt: OpaquePointer, _ index: Int32) -> Double? {
-        sqlite3_column_type(stmt, index) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, index)
+        isNull(stmt, index) ? nil : sqlite3_column_double(stmt, index)
+    }
+    private func optionalCount(_ stmt: OpaquePointer, _ index: Int32) -> Int? {
+        isNull(stmt, index) ? nil : Int(sqlite3_column_int64(stmt, index))
+    }
+    private func optionalDate(_ stmt: OpaquePointer, _ index: Int32) -> Date? {
+        optionalDouble(stmt, index).map(Date.init(timeIntervalSince1970:))
+    }
+    private func optionalText(_ stmt: OpaquePointer, _ index: Int32) -> String? {
+        isNull(stmt, index) ? nil : text(stmt, index)
     }
     private func text(_ stmt: OpaquePointer, _ index: Int32) -> String {
         guard let cString = sqlite3_column_text(stmt, index) else { return "" }
         return String(cString: cString)
+    }
+
+    /// The `phase` column without building a `String` for it.
+    ///
+    /// `samples(for:)` reads every row of a session — 38,000 for an overnight
+    /// run — and went through `String(cString:)` plus `LoadPhase(rawValue:)` on
+    /// each one, so loading a saved session allocated one short string per
+    /// sample for a column that is `idle` on more than 99% of rows. The bytes
+    /// are compared in place for the idle case; the rare load-tagged rows take
+    /// the original path.
+    private func phase(_ stmt: OpaquePointer, _ index: Int32) -> LoadPhase {
+        guard let cString = sqlite3_column_text(stmt, index) else { return .idle }
+        if Self.isIdle(cString) { return .idle }
+        return LoadPhase(rawValue: String(cString: cString)) ?? .idle
+    }
+
+    /// `true` when the NUL-terminated bytes at `pointer` spell "idle". Reads a
+    /// byte past the previous one only when that one matched, so it never
+    /// runs beyond the terminator of a shorter string.
+    private static func isIdle(_ pointer: UnsafePointer<UInt8>) -> Bool {
+        let idle: [UInt8] = [0x69, 0x64, 0x6C, 0x65] // "idle"
+        for (offset, byte) in idle.enumerated() where pointer[offset] != byte {
+            return false
+        }
+        return pointer[idle.count] == 0
     }
 }

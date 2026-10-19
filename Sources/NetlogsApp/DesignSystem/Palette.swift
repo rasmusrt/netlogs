@@ -42,9 +42,27 @@ enum Palette {
 
     // MARK: - Status ramp
 
+    // Colour is reserved for something worth noticing. "Fine" is drawn in the
+    // default text colour almost everywhere — a screen of green says nothing
+    // and drowns the one orange figure that does. `good` survives only where
+    // it is the answer itself: the verdict icon and the live indicator.
     static let good = Color.green
-    static let warn = Color.yellow
-    static let bad = Color.orange
+    static let warn = Color(nsColor: NSColor(name: "netlogs.warn") { appearance in
+        // System yellow is built for dark backgrounds. On the light window it
+        // measured about 1.6:1 — "80.0 ms" in the Latency sheet was barely
+        // there. Light gets a deep amber (~4.5:1 on the card fill); dark keeps
+        // system yellow, which already reads well there.
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? .systemYellow
+            : NSColor(srgbRed: 0.58, green: 0.40, blue: 0.0, alpha: 1)
+    })
+    /// Same treatment as ``warn``: system orange is about 2.3:1 on the light
+    /// window, so light gets a burnt orange (~4.5:1); dark is unchanged.
+    static let bad = Color(nsColor: NSColor(name: "netlogs.bad") { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? .systemOrange
+            : NSColor(srgbRed: 0.72, green: 0.30, blue: 0.0, alpha: 1)
+    })
     static let critical = Color.red
 
     /// The wash behind a status-tinted surface — badges, banners, bands.
@@ -98,12 +116,6 @@ enum Palette {
         case .high:     return bad
         case .severe:   return critical
         }
-    }
-
-    /// A colour for every latency, for the log table's pills — where "this one
-    /// is fine" is worth saying out loud rather than leaving blank.
-    static func pill(_ milliseconds: Double, on ramp: LatencyGrade.Ramp) -> Color {
-        latency(milliseconds, on: ramp) ?? good
     }
 
     /// Jitter, on the ramp anchored to the rule the verdict already uses.

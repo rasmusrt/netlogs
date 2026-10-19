@@ -128,7 +128,7 @@ struct SummaryCards: View {
                     stat: latency.router, late: latency.routerLate,
                     systemImage: "wifi.router", help: Explain.routerCard,
                     ramp: .gateway)
-            .tappable(.latency, onSelect)
+            .tappable(.latency, onSelect, host: .router)
     }
 
     private var internetCard: some View {
@@ -136,119 +136,7 @@ struct SummaryCards: View {
                     stat: latency.internet, late: latency.internetLate,
                     systemImage: "globe", help: Explain.internetCard,
                     ramp: .internet)
-            .tappable(.latency, onSelect)
-    }
-}
-
-// MARK: - Container
-
-/// One full-width card: icon, uppercase title, optional subtitle, a chevron
-/// when it leads somewhere, and a row of values underneath.
-struct SummaryCard<Content: View>: View {
-    let title: String
-    let systemImage: String
-    var subtitle: String?
-    var accessory: AnyView?
-    var showsChevron = true
-    /// Explains what the card measures. Attached to the title row, which is the
-    /// part you hover when you are asking "what is this card?".
-    var help: String?
-    @ViewBuilder var content: Content
-    @Environment(\.cardFillsHeight) private var fillsHeight
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: Space.xs) {
-            HStack(spacing: Space.s) {
-                Image(systemName: systemImage)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 18)
-                Text(title.uppercased())
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .tracking(0.6)
-                    .helpIfPresent(help)
-                if let subtitle {
-                    Text(subtitle)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                Spacer(minLength: Space.s)
-                accessory
-                if showsChevron {
-                    Image(systemName: "chevron.right")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.quaternary)
-                }
-            }
-            content
-        }
-        .padding(.horizontal, Space.m)
-        .padding(.vertical, Space.s + 2)
-        .frame(maxWidth: .infinity,
-               maxHeight: fillsHeight ? .infinity : nil,
-               alignment: .topLeading)
-        .cardSurface()
-    }
-}
-
-/// Set on a row of cards that should share one height. The surface is drawn
-/// inside the card, so stretching the card from outside would stretch an
-/// invisible frame and leave the backgrounds at their own heights.
-private struct CardFillsHeightKey: EnvironmentKey {
-    static let defaultValue = false
-}
-
-extension EnvironmentValues {
-    var cardFillsHeight: Bool {
-        get { self[CardFillsHeightKey.self] }
-        set { self[CardFillsHeightKey.self] = newValue }
-    }
-}
-
-/// A labelled number. The label is small and quiet; the number is the thing.
-///
-/// `help` is what lets the labels stay technical. RSSI, SNR and bufferbloat are
-/// the real names for these measurements, and someone diagnosing a connection
-/// will want to search for them or quote them to an ISP — renaming them to
-/// "signal" and "noise margin" made the app friendlier and less useful at the
-/// same time. The term stays; hovering explains it.
-struct StatValue: View {
-    let label: String
-    let value: String
-    var unit: String?
-    var tint: Color?
-    var help: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(label.uppercased())
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(.tertiary)
-                .tracking(0.5)
-            HStack(alignment: .firstTextBaseline, spacing: 2) {
-                Text(value)
-                    // 14pt rather than title3's 15. A point sounds like
-                    // nothing, but it comes off four values in each card and
-                    // pulls the pair's combined minimum under a common window
-                    // width, which is what decides whether they sit together.
-                    .font(.system(size: 14, weight: .medium).monospacedDigit())
-                    .foregroundStyle(tint ?? .primary)
-                if let unit {
-                    Text(unit)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-            }
-        }
-        .fixedSize()
-        .helpIfPresent(help)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(Text(label))
-        .accessibilityValue(Text("\(value) \(unit ?? "")"))
-        .accessibilityHint(Text(help ?? ""))
+            .tappable(.latency, onSelect, host: .internet)
     }
 }
 
@@ -382,14 +270,11 @@ struct LatencyCard: View {
         SummaryCard(title: title, systemImage: systemImage, subtitle: host,
                     help: help) {
             HStack(alignment: .firstTextBaseline, spacing: Space.m) {
-                // Min green *when it deserves it*, max red — the two ends of
-                // the range are what the eye lands on, so the average stays
-                // neutral. Min was hardcoded to green, which made a session
-                // whose best ping was 900 ms show a green floor beside a red
-                // ceiling: the one figure that cannot lie about a connection
-                // being fine, lying about it.
+                // Tinted only when a figure is out of range, never green for
+                // being fine. A high min is the strongest sign of a slow link
+                // there is, so it gets the same ramp as max.
                 StatValue(label: "min", value: number(stat.min), unit: "ms",
-                          tint: stat.samples == 0 ? nil : Palette.pill(stat.min, on: ramp),
+                          tint: stat.samples == 0 ? nil : Palette.latency(stat.min, on: ramp),
                           help: Explain.minimum)
                 StatValue(label: "avg", value: number(stat.avg), unit: "ms",
                           help: Explain.average)
@@ -482,10 +367,10 @@ struct ThroughputCard: View {
                                        ping: Double?, jitter: Double?, loss: Double?),
                             _ grade: BufferbloatGrade?) -> some View {
         StatValue(label: "download", value: Fmt.mbps(values.down),
-                  unit: "Mbps", tint: Palette.good,
+                  unit: "Mbps",
                   help: Explain.download)
         StatValue(label: "upload", value: Fmt.mbps(values.up),
-                  unit: "Mbps", tint: Palette.Chart.internet,
+                  unit: "Mbps",
                   help: Explain.upload)
         StatValue(label: "bufferbloat",
                   value: values.bloat.map { "+\(Fmt.msCoarse($0))" } ?? "—", unit: "ms",
@@ -627,10 +512,10 @@ struct NetworkCard: View {
     }
 
     /// Wi-Fi signal, in the terms the Wi-Fi menu uses: −60 and better is a
-    /// strong link, −70 is usable, −80 is trouble.
+    /// strong link, −70 is usable, −80 is trouble. A strong link is left plain.
     static func rssiTint(_ dBm: Int) -> Color? {
         switch dBm {
-        case (-60)...:  return Palette.good
+        case (-60)...:  return nil
         case (-70)...:  return Palette.warn
         case (-80)...:  return Palette.bad
         default:        return Palette.critical
@@ -639,7 +524,7 @@ struct NetworkCard: View {
 
     static func snrTint(_ dB: Int) -> Color? {
         switch dB {
-        case 25...: return Palette.good
+        case 25...: return nil
         case 15...: return Palette.warn
         default:    return Palette.bad
         }
@@ -648,9 +533,12 @@ struct NetworkCard: View {
 
 // MARK: - Affordance
 
-private extension View {
-    func tappable(_ sheet: SessionSheet, _ onSelect: ((SessionSheet) -> Void)?) -> some View {
-        modifier(TappableCard(sheet: sheet, onSelect: onSelect))
+extension View {
+    /// `host` is for the two latency cards: the sheet opens on the host whose
+    /// card was clicked.
+    func tappable(_ sheet: SessionSheet, _ onSelect: ((SessionSheet) -> Void)?,
+                  host: PingHost? = nil) -> some View {
+        modifier(TappableCard(sheet: sheet, host: host, onSelect: onSelect))
     }
 }
 
@@ -658,8 +546,16 @@ private extension View {
 /// cards hides its destinations completely.
 private struct TappableCard: ViewModifier {
     let sheet: SessionSheet
+    let host: PingHost?
     let onSelect: ((SessionSheet) -> Void)?
     @State private var hovering = false
+
+    private func open(_ onSelect: (SessionSheet) -> Void) {
+        if let host {
+            UserDefaults.standard.set(host.rawValue, forKey: PingHost.latencySheetKey)
+        }
+        onSelect(sheet)
+    }
 
     func body(content: Content) -> some View {
         if let onSelect {
@@ -670,28 +566,17 @@ private struct TappableCard: ViewModifier {
                         .strokeBorder(.tint.opacity(hovering ? 0.55 : 0), lineWidth: 1)
                 }
                 .onHover { hovering = $0 }
-                .onTapGesture { onSelect(sheet) }
+                .onTapGesture { open(onSelect) }
                 // No `.pointerStyle` here. It installs a tracking area across
                 // the whole card, which swallowed the `.help` tooltips on the
                 // values inside it — the hover ring still appeared, so the card
                 // looked alive while every explanation had gone silent.
                 .accessibilityAddTraits(.isButton)
+                // The trait alone announced a button that VoiceOver could not press.
+                .accessibilityAction { open(onSelect) }
         } else {
             content
         }
-    }
-}
-
-/// The one empty-state treatment used inside a card or inspector section.
-struct EmptyNote: View {
-    let text: String
-    init(_ text: String) { self.text = text }
-
-    var body: some View {
-        Text(text)
-            .font(.callout)
-            .foregroundStyle(.tertiary)
-            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

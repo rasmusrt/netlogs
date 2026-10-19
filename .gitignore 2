@@ -1,0 +1,11 @@
+.build/
+.swiftpm/
+.DS_Store
+build/
+
+# Xcode per-user state. The project file and the shared Netlogs scheme
+# (xcshareddata/) are committed; everything below is machine-local.
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad
+DerivedData/

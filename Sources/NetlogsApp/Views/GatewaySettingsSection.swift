@@ -131,12 +131,10 @@ struct GatewaySettingsSection: View {
 
         case .certificateChanged(let sha):
             VStack(alignment: .leading, spacing: Space.s) {
-                Label("The gateway now presents a different certificate, so the key was "
-                      + "not sent. That is expected after a reset or a new gateway. If "
-                      + "neither happened, do not accept it.",
-                      systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(Palette.bad)
+                Notice(.warning,
+                       message: "The gateway now presents a different certificate, so the key "
+                           + "was not sent. That is expected after a reset or a new gateway. "
+                           + "If neither happened, do not accept it.")
                 Text("New SHA-256 " + UniFiGateway.display(sha))
                     .font(.caption2.monospaced())
                     .textSelection(.enabled)

@@ -7,6 +7,7 @@ struct SettingsScreen: View {
     var store: SessionStore?
 
     @State private var dbBytes = 0
+    @Environment(Updater.self) private var updater: Updater?
 
     /// The address the router probe will actually use. With auto-detect on, a
     /// duplicate is easiest to create without noticing — the field is disabled
@@ -79,6 +80,16 @@ struct SettingsScreen: View {
                 LabeledContent("Database size",
                                value: ByteCountFormatter.string(fromByteCount: Int64(dbBytes), countStyle: .file))
             }
+            if let updater { UpdateSettingsSection(updater: updater) }
+            Section {
+                Toggle("Try the new Monitor", isOn: $settings.monitorV2Beta)
+            } header: {
+                Text("Beta")
+            } footer: {
+                Text("A calmer live screen with a per-second chart. Switch back at any time; a running session carries on.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
     }
@@ -105,16 +116,11 @@ struct SettingsScreen: View {
                 // like a network fault rather than a settings mistake. Saying
                 // so here is the cheapest place to say it.
                 if let duplicateHost {
-                    Label {
-                        Text("Both probes would ping \(duplicateHost). They are sent "
-                             + "with the same sequence number, so one overwrites the "
-                             + "other and about half of every tick is logged as a "
-                             + "timeout — from a host that replied.")
-                    } icon: {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                    }
-                    .font(.caption)
-                    .foregroundStyle(Palette.bad)
+                    Notice(.warning,
+                           message: "Both probes would ping \(duplicateHost). They are sent "
+                               + "with the same sequence number, so one overwrites the "
+                               + "other and about half of every tick is logged as a "
+                               + "timeout — from a host that replied.")
                 }
             }
             Section("Ping") {

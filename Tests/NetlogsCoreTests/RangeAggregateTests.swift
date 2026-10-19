@@ -147,6 +147,45 @@ final class RangeAggregateTests: XCTestCase {
         XCTAssertEqual(aggregate.bothTimeouts, 1, "seq 6, where neither answered")
     }
 
+    /// The per-hour loss and jitter the Analysis chart draws must add up to
+    /// the session's own figures when the session fits in one hour.
+    func testHourlyPingStatsMatchTheSessionFigures() throws {
+        let store = try store("hourly-stats.sqlite")
+        let session = try store.startSession(MonitorSettings(), startedAt: epoch)
+        for sample in awkwardStream() { store.append(sample, to: session.id) }
+        try store.flush()
+
+        let hours = try store.hourlyPingStats(for: [session.id])
+        XCTAssertEqual(hours.count, 1, "the whole stream is 21 seconds long")
+        let hour = try XCTUnwrap(hours.first)
+        let aggregate = try XCTUnwrap(try store.pingAggregates(for: [session.id])[session.id])
+
+        XCTAssertEqual(hour.samples, aggregate.totalSamples)
+        XCTAssertEqual(hour.routerLost, 2, "seq 4 and 6")
+        XCTAssertEqual(hour.internetOnlyLost, 1, "seq 5; seq 6 lost both")
+        XCTAssertEqual(hour.jitterPairs, aggregate.internet.jitterPairs)
+        XCTAssertEqual(try XCTUnwrap(hour.measuredJitter),
+                       try XCTUnwrap(aggregate.internet.measuredJitter), accuracy: 1e-9)
+    }
+
+    func testHourlyPingStatsSplitByHourAndSkipLoad() throws {
+        let store = try store("hourly-split.sqlite")
+        let session = try store.startSession(MonitorSettings(), startedAt: epoch)
+        var samples = awkwardStream()
+        samples.append(PingSample(id: 22, timestamp: epoch.addingTimeInterval(22),
+                                  routerMs: nil, internetMs: nil, phase: .downloading))
+        samples.append(PingSample(id: 23, timestamp: epoch.addingTimeInterval(3 * 3600),
+                                  routerMs: 3, internetMs: 20, phase: .idle))
+        for sample in samples { store.append(sample, to: session.id) }
+        try store.flush()
+
+        let hours = try store.hourlyPingStats(for: [session.id])
+        XCTAssertEqual(hours.count, 2)
+        XCTAssertEqual(hours.map(\.samples).reduce(0, +), 10,
+                       "nine idle samples in the first hour, one later; the loaded one is left out")
+        XCTAssertEqual(hours.map(\.routerLost).reduce(0, +), 2)
+    }
+
     // MARK: - Selection
 
     func testSelectsSessionsByOverlapAndReportsThemWhole() throws {

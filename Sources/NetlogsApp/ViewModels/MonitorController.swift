@@ -98,14 +98,7 @@ final class MonitorController {
             settings.routerHost = gateway
         }
         state = .starting
-        stats.reset()
-        log.reset()
-        chart.reset()
-        failures.reset()
-        diagnostics.reset()
-        throughput.reset()
-        traffic.reset()
-        wan.reset()
+        resetModels()
         captureTrigger = TrafficCaptureTrigger()
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.idleSystemSleepDisabled, .userInitiated],
@@ -124,11 +117,7 @@ final class MonitorController {
         // the engine's socket warm-up. Without this cancel it woke up after the
         // teardown and rebuilt the session this call had just dismantled.
         pump?.cancel(); pump = nil
-        clock?.cancel(); clock = nil
-        diagMonitor?.stop(); diagMonitor = nil
-        diagPump?.cancel(); diagPump = nil
-        stopWAN()
-        throughputPump?.cancel(); throughputPump = nil
+        tearDownAuxiliaries()
         manualTest?.cancel(); manualTest = nil
         capture?.cancel(); capture = nil
         traffic.captureFailed()
@@ -214,7 +203,7 @@ final class MonitorController {
                 // (~1 s); keep them in the log and on disk, but don't let them
                 // skew the session stats or set the chart's y-axis
                 // (PHASE1-FINDINGS §3).
-                if sample.id >= PingSample.warmupSampleCount {
+                if !sample.isWarmup {
                     stats.add(sample)
                     chart.append(sample)
                     // Same exclusion: a warm-up timeout is a socket artefact,
@@ -226,8 +215,7 @@ final class MonitorController {
                 log.append(sample)
                 store.append(sample, to: session.id)
 
-                if settings.trafficCaptureEnabled,
-                   sample.id >= PingSample.warmupSampleCount {
+                if settings.trafficCaptureEnabled, !sample.isWarmup {
                     considerCapture(sample, sessionID: session.id)
                 }
             }
@@ -238,11 +226,7 @@ final class MonitorController {
             // session of whatever run started in the meantime.
             guard !Task.isCancelled else { return }
             endActivity()
-            clock?.cancel(); clock = nil
-            diagMonitor?.stop(); diagMonitor = nil
-            diagPump?.cancel(); diagPump = nil
-            stopWAN()
-            throughputPump?.cancel(); throughputPump = nil
+            tearDownAuxiliaries()
             state = .error(Self.describe(error))
             if let session { try? store.stopSession(session.id) }
             self.engine = nil
@@ -290,6 +274,31 @@ final class MonitorController {
             ProcessInfo.processInfo.endActivity(activity)
             self.activity = nil
         }
+    }
+
+    /// Clears every per-session view model before a new run. One list, so a
+    /// model added later is reset here or nowhere — not in one of two copies.
+    private func resetModels() {
+        stats.reset()
+        log.reset()
+        chart.reset()
+        failures.reset()
+        diagnostics.reset()
+        throughput.reset()
+        traffic.reset()
+        wan.reset()
+    }
+
+    /// Stops everything that runs beside the ping stream: the clock, the
+    /// diagnostics and gateway pollers, and the scheduled throughput test.
+    /// Shared by `stop()` and the failure path in `run(settings:)`, which
+    /// used to carry two copies of this list.
+    private func tearDownAuxiliaries() {
+        clock?.cancel(); clock = nil
+        diagMonitor?.stop(); diagMonitor = nil
+        diagPump?.cancel(); diagPump = nil
+        stopWAN()
+        throughputPump?.cancel(); throughputPump = nil
     }
 
     private func startDiagnostics(settings: MonitorSettings, sessionID: UUID) {
