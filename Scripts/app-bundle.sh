@@ -59,17 +59,26 @@ DEVID="$(security find-identity -v -p codesigning 2>/dev/null \
 
 [ "${1:-}" = "--build-only" ] && { codesign --force --sign "$SIGN" --timestamp=none --entitlements Support/Netlogs.entitlements "$STAGE"; exit 0; }
 
-# "Netlogs Beta", so a local build is never mistaken for the released app in
-# /Applications (Homebrew). Same bundle identifier, so both read the same
-# sessions and settings; only the name in Finder, Spotlight and the menu bar
-# differs. Builds from before the rename went to ~/Applications/Netlogs.app.
-DEST="$HOME/Applications/Netlogs Beta.app"
+# In this workshop repo the local build is "Netlogs Beta", so it is never
+# mistaken for the released app in /Applications (Homebrew). Same bundle
+# identifier, so both read the same sessions and settings; only the name in
+# Finder, Spotlight and the menu bar differs. The public source repo is the
+# product, so a build from it is plain "Netlogs". publish-source.sh is never
+# published, which makes it the marker for which repo this is.
+if [ -f Scripts/publish-source.sh ]; then
+    APP_NAME="Netlogs Beta"
+    # Builds from before the rename went to ~/Applications/Netlogs.app.
+    rm -rf "$HOME/Applications/Netlogs.app"
+else
+    APP_NAME="Netlogs"
+fi
+DEST="$HOME/Applications/$APP_NAME.app"
 mkdir -p "$HOME/Applications"
-rm -rf "$DEST" "$HOME/Applications/Netlogs.app"
+rm -rf "$DEST"
 cp -R "$STAGE" "$DEST"
 xattr -cr "$DEST"   # strip iCloud provenance / any quarantine
 for key in CFBundleName CFBundleDisplayName; do
-    /usr/libexec/PlistBuddy -c "Set :$key Netlogs Beta" "$DEST/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :$key $APP_NAME" "$DEST/Contents/Info.plist"
 done
 # Signed at the final location (no --deep / no hardened runtime — they only
 # add Gatekeeper friction for a local dev build).

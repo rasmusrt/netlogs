@@ -1,6 +1,6 @@
 # Netlogs privacy policy
 
-_Last updated: 31 August 2026. Applies to Netlogs for macOS, version 0.1.0._
+_Last updated: 20 October 2026. Applies to Netlogs for macOS, version 0.2.0 and later._
 
 Netlogs has no servers, no accounts, and no analytics. Nothing you record is
 sent to us, because there is no "us" to send it to. What follows is the whole
@@ -58,7 +58,8 @@ file. Nothing is retained elsewhere, because nothing is sent elsewhere.
 
 ## What Netlogs sends, and to whom
 
-Three kinds of traffic leave your Mac, all of them measurements you asked for.
+Four kinds of traffic leave your Mac: three are measurements you asked for,
+and one is the update check.
 
 **1. Pings to your router.** ICMP echo requests to your own gateway. This
 traffic does not leave your local network.
@@ -84,13 +85,22 @@ endpoints Cloudflare's own speed test uses. This means:
 Speed tests only run when you start one or when you enable automatic tests. If
 you never run one, Netlogs never contacts Cloudflare for throughput.
 
+**4. The update check, to GitHub.** Once a day, Netlogs asks
+`api.github.com` for the latest release of Netlogs, so it can tell you when a
+new version is out. The request carries no data about you or your sessions,
+but like any web request it discloses your IP address to GitHub, whose
+handling of it is governed by
+[GitHub's privacy statement](https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement).
+Turn it off under **Settings → Updates → Check for updates automatically**;
+"Check for Updates…" in the menu still works when you want it. Nothing is
+downloaded or installed without you choosing to.
+
 ## What Netlogs does not do
 
 - No analytics, telemetry, usage reporting or crash reporting of any kind.
 - No accounts, no sign-in, no cloud sync, no backups to anywhere.
 - No advertising, and no data sold or shared with anyone.
 - **Location is not used.** Netlogs requests no location permission.
-- No automatic updates, and so no update pings.
 
 ## Exports
 

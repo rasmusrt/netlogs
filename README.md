@@ -10,8 +10,8 @@ outside it.
 
 ## What it measures
 
-- **Two pings a second, side by side.** Your router and an internet host. When
-  only one of them stops answering, you know which half is broken.
+- **Your router and the internet, side by side.** One ping a second to each.
+  When only one of them stops answering, you know which half is broken.
 - **Latency under load.** Speed tests report throughput *and* what happened to
   ping and jitter while the line was saturated — bufferbloat, the thing that
   makes a fast connection feel slow on calls.
@@ -46,19 +46,20 @@ cd netlogs
 Scripts/app-bundle.sh
 ```
 
-That builds the app, installs it to `~/Applications` as "Netlogs Beta", and opens it. You need
+That builds the app, installs it to `~/Applications/Netlogs.app`, and opens it. You need
 Xcode or the Command Line Tools; nothing else.
 
 ## Requirements
 
-macOS 15 (Sequoia) or later, on Apple silicon or Intel.
+macOS 15 (Sequoia) or later. The Homebrew download is built for Apple silicon;
+on an Intel Mac, build from source.
 
 ## Privacy
 
 Netlogs has no servers, no accounts, and no analytics. Your sessions live in a
-SQLite database on your Mac and are never uploaded. It does talk to two places,
-both of them measurements you asked for: whatever host you ping, and Cloudflare
-when you run a speed test. [PRIVACY.md](PRIVACY.md) spells out exactly what
+SQLite database on your Mac and are never uploaded. It talks to three places:
+whatever host you ping, Cloudflare when you run a speed test, and GitHub once a
+day to see whether a newer version is out (Settings → Updates turns that off). [PRIVACY.md](PRIVACY.md) spells out exactly what
 that means, including the parts that are easy to forget to mention.
 
 ## Licence
