@@ -46,7 +46,7 @@ cd netlogs
 Scripts/app-bundle.sh
 ```
 
-That builds the app, installs it to `~/Applications` as "Netlogs Beta", and opens it. You need
+That builds the app, installs it to `~/Applications/Netlogs.app`, and opens it. You need
 Xcode or the Command Line Tools; nothing else.
 
 ## Requirements
